@@ -1,0 +1,13 @@
+{
+  "name": "spec-driven-toolkit",
+  "private": true,
+  "description": "Repository-level tooling: Git hooks and coding-agent setup for the spec-driven toolkit.",
+  "scripts": {
+    "prepare": "(lefthook install || echo 'skipped git hooks (not a git repo yet)') && (python3 scripts/agent_setup.py sync || echo 'skipped sub-agent generation; run python3 scripts/agent_setup.py sync')",
+    "setup-agents": "python3 scripts/agent_setup.py setup"
+  },
+  "devDependencies": {
+    "lefthook": "^2.1.14",
+    "prettier": "^3.9.9"
+  }
+}

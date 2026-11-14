@@ -1,0 +1,88 @@
+name: Sync Roadmap to GitHub Issues
+
+on:
+  push:
+    # `branches` cannot take an expression; the job runs only on the default branch (see its `if`).
+    paths:
+      - ROADMAP.md
+      - specs/*/spec.md
+      - specs/*/plan.md
+      - specs/*/tasks.md
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Apply changes (otherwise print a dry run)'
+        required: true
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 5 * * *'
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  sync:
+    # Push and manual runs must be on the default branch, whatever it is called. A schedule always runs
+    # on it, and its payload has no `repository` (so `default_branch` would be empty there).
+    if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    # On the job, not the workflow: a skipped feature-branch run must not cancel a pending run on the
+    # default branch. Read-only previews must not replace a pending issue-mutating sync.
+    concurrency:
+      group: ${{ github.event_name == 'workflow_dispatch' && inputs.apply == true && 'issue-sync' || 'issue-sync-preview' }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    env:
+      HAS_BOARD_APP: ${{ secrets.PROJECT_STATUS_APP_ID != '' && secrets.PROJECT_BOARD_APP_PRIVATE_KEY != '' }}
+      HAS_BOARD_PAT: ${{ secrets.PROJECT_BOARD_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Empty on a schedule (no `repository` in its payload); then the default is the event's ref.
+          ref: ${{ github.event.repository.default_branch || github.ref }}
+          persist-credentials: false
+
+      - name: Read configured Project owner
+        id: project-config
+        run: |
+          # Prints the owner, or a skip notice (no credential, or not initialized yet) and no owner;
+          # fails once the repository is initialized and project-context.toml is missing or invalid.
+          owner=$(python3 scripts/project_context.py --repository-owner "${GITHUB_REPOSITORY%%/*}" --board-owner-or-skip)
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+
+      - name: Read the repository name
+        id: repo
+        # A schedule payload has no `repository`, so the App token's `repositories` cannot come from the event.
+        run: |
+          echo "name=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create optional board token
+        id: board-token
+        if: ${{ env.HAS_BOARD_APP == 'true' && steps.project-config.outputs.owner != '' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.PROJECT_STATUS_APP_ID }}
+          private-key: ${{ secrets.PROJECT_BOARD_APP_PRIVATE_KEY }}
+          owner: ${{ steps.project-config.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+          permission-issues: read
+          permission-organization-projects: write
+
+      - name: Synchronize roadmap issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # App token first; PROJECT_BOARD_TOKEN only once the project context is read.
+          BOARD_GH_TOKEN: ${{ steps.board-token.outputs.token || (steps.project-config.outputs.owner != '' && secrets.PROJECT_BOARD_TOKEN) || '' }}
+          APPLY_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.apply }}
+        run: |
+          args=()
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$APPLY_REQUESTED" == "true" ]]; then
+            args+=(--apply)
+          fi
+          if [[ -z "$BOARD_GH_TOKEN" ]]; then
+            args+=(--skip-project)
+            echo "Board sync skipped (see notices above)."
+          fi
+          python3 scripts/sync-roadmap-issues.py "${args[@]}"

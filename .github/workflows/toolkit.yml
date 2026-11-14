@@ -1,0 +1,57 @@
+# Checks for the spec-driven toolkit itself (scripts, skills, sub-agents, Spec Kit, roadmap).
+# Needs no application package, cloud account or credentials. Add application checks in their own workflow.
+name: Toolkit
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  repository-tools:
+    # The job name is a required status check in the default-branch ruleset; keep it stable.
+    name: Repository tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: node --test scripts/check-secrets.test.mjs
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Check the roadmap format once the repository is initialized
+        run: |
+          # Before bootstrap there is no ROADMAP.md, project-context.toml, constitution or spec yet,
+          # so there is nothing to check. Once any of them exists, a missing or invalid ROADMAP.md fails here.
+          set -euo pipefail
+          # A separate assignment, so a failing state query fails the step instead of skipping.
+          state=$(python3 scripts/project_context.py --bootstrap-state)
+          if [ "$state" = "initialized" ]; then
+            python3 scripts/check_roadmap.py
+          elif [ "$state" = "uninitialized" ]; then
+            echo "::notice::Roadmap check skipped: this repository is not initialized yet (no ROADMAP.md, project-context.toml, constitution or specs). See docs/bootstrap.md."
+          else
+            echo "::error::Unexpected output from project_context.py --bootstrap-state: '$state' (expected initialized or uninitialized)."
+            exit 1
+          fi
+      - name: Check the toolkit export manifest classifies every tracked file
+        run: |
+          # Only the toolkit's source repository (project-context.toml: toolkit.export_source = true)
+          # classifies files for export. A missing project-context.toml (bootstrap) means "not the source".
+          set -euo pipefail
+          # A separate assignment, so an invalid project-context.toml fails the step instead of skipping.
+          export_source=$(python3 scripts/project_context.py --toolkit-export-source)
+          if [ "$export_source" = "true" ]; then
+            python3 scripts/export_toolkit.py --check
+          elif [ "$export_source" = "false" ]; then
+            echo "::notice::Toolkit export check skipped: this repository is not the toolkit source (toolkit.export_source is not true in project-context.toml)."
+          else
+            echo "::error::Unexpected output from project_context.py --toolkit-export-source: '$export_source' (expected true or false)."
+            exit 1
+          fi
+      - name: Check agent skills, sub-agents and Spec Kit version
+        run: python3 scripts/agent_setup.py check

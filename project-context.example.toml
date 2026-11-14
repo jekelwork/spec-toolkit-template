@@ -1,0 +1,19 @@
+[project]
+name = "Example project"
+description = "Describe your project."
+
+[github_project]
+owner = "example-org"
+number = 123
+
+# Optional. Independent approvals a pull request needs. 0 means a solo project
+# with no independent approval; the default is 1 when this section is absent.
+# `python3 scripts/bootstrap.py github` applies it to the branch ruleset. State
+# the same number in the constitution's approval rule.
+# [review]
+# required_approvals = 1
+
+# Optional. Set to true only in the repository that is the source of the exported
+# toolkit; it makes the Toolkit workflow check scripts/toolkit-export.toml.
+# [toolkit]
+# export_source = false

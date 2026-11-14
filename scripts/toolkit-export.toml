@@ -1,0 +1,87 @@
+# Manifest for scripts/export_toolkit.py: which git-tracked files form the
+# project-neutral toolkit that is exported for reuse in other projects.
+#
+#   include  list of glob patterns for files that are exported.
+#   exclude  list of glob patterns for files that are never exported
+#            (product governance replaced per project). Exclude wins over include.
+#
+# Every tracked path at the exported ref must match at least one include or one
+# exclude pattern; otherwise it is "unclassified" and the export fails, so a new
+# file forces an explicit decision.
+#
+# Glob semantics (paths are relative to the repository root, "/" separated,
+# patterns are anchored at the root and match the whole path; at most 1000
+# patterns per list, each at most 512 characters):
+#   *      any characters (newlines included) except "/"
+#   ?      one character except "/"
+#   [abc]  one character from the set, never "/"; ranges like [a-z] must be
+#          ascending; [!abc] is any character except those and "/"; a "^"
+#          inside a class is literal; "]" right after "[" or "[!" is literal;
+#          an unterminated "[" or a reversed range is an error
+#   **     only as a whole path segment it is recursive: "dir/**" matches every
+#          file below dir (not dir itself), "**/x" matches x at any depth
+#          including the root, "a/**/b" matches a/b and a/x/y/b. Inside a
+#          segment (for example "x**y") it behaves like "*". Dotfiles are not
+#          special: "*" and "**" match names starting with ".". Empty segments
+#          ("dir/", "/dir", "a//b") are errors.
+#
+# [symlinks] is the allowlist of symlinks the export may contain, as
+# path = "exact target". Every other symlink in the exported set is refused
+# ("undeclared symlink"), as is a declared one that is missing at the ref, is
+# not a symlink there, is not exported, has a different target (byte for byte),
+# or whose target does not resolve to an exported file or directory. Targets
+# are resolved by exact string steps; a target may not pass through (or end at)
+# another declared symlink, and paths below a declared symlink are refused.
+# Prefer explicit area globs over a catch-all "**" so unrelated new top-level
+# files stay unclassified.
+
+include = [
+  ".agents/**",
+  ".claude/skills",
+  ".specify/**",
+  "agent-definitions/**",
+  "scripts/**",
+  ".github/workflows/*.yml",
+  ".lefthook/**",
+  "docs/bootstrap.md",
+  "docs/roadmap-format.md",
+  ".gitignore",
+  ".nvmrc",
+  ".prettierignore",
+  ".prettierrc.json",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "README.md",
+  "lefthook.yml",
+  "package.json",
+  "package-lock.json",
+  "project-context.example.toml",
+]
+
+exclude = [
+  "specs/**",
+  "ROADMAP.md",
+  # This repository's own governance files; not exported. An adopting project writes its own if needed.
+  "project-brief.md",
+  "constitution-prompt-proposal.md",
+  "project-context.toml",
+  ".specify/memory/constitution.md",
+  ".specify/memory/.constitution-template.json",
+  "docs/handoff-*.md",
+  # Guards this repository's toolkit.export_source flag; only meaningful in the toolkit's source repository.
+  "scripts/test_toolkit_source_guard.py",
+  # Exports this repository and asserts the not-initialized state; it only applies to the toolkit source
+  # repository (it skips elsewhere), so it is not exported.
+  "scripts/test_fresh_export.py",
+  ".github/CODEOWNERS",
+  # Vendored skill for web front ends (Chrome DevTools MCP, `@latest`); this repository keeps it, the
+  # template leaves it out. skills-lock.json is excluded with it: a lock must not list a skill the
+  # export lacks, and an adopting project's `npx skills add` writes its own.
+  ".agents/skills/browser-testing-with-devtools/**",
+  "skills-lock.json",
+  # Empty Spec Kit workflow registry; .specify/workflows/ is not part of this process.
+  ".specify/workflows/workflow-registry.json",
+]
+
+[symlinks]
+".claude/skills" = "../.agents/skills"

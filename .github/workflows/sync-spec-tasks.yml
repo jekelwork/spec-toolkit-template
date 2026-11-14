@@ -1,0 +1,139 @@
+name: Sync Spec Tasks to GitHub Issues
+
+on:
+  pull_request:
+    types: [closed]
+  schedule:
+    - cron: '47 5 * * *'
+  workflow_dispatch:
+    inputs:
+      feature:
+        description: 'Feature directory to sync (e.g. specs/008-example-feature). Leave empty to sync every specs/*/tasks.md.'
+        required: false
+        type: string
+      apply:
+        description: Apply changes (otherwise print a dry run)
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  sync:
+    # A schedule always runs on the default branch (its payload has no `repository`); manual runs target the default branch; PR runs apply only after a default-branch merge.
+    if: >-
+      (github.event_name == 'workflow_dispatch' &&
+        github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.base.ref == github.event.repository.default_branch)
+    concurrency:
+      group: >-
+        ${{ (github.event_name == 'pull_request' ||
+          (github.event_name == 'workflow_dispatch' && inputs.apply == true) ||
+          (github.event_name == 'schedule' && vars.PHASE_SYNC_AUTO_APPLY == 'true')) &&
+          'issue-sync' || 'issue-sync-preview' }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    env:
+      HAS_BOARD_APP: ${{ secrets.PROJECT_STATUS_APP_ID != '' && secrets.PROJECT_BOARD_APP_PRIVATE_KEY != '' }}
+      HAS_BOARD_PAT: ${{ secrets.PROJECT_BOARD_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Read configured Project owner
+        id: project-config
+        run: |
+          # Prints the owner, or a skip notice (no credential, or not initialized yet) and no owner;
+          # fails once the repository is initialized and project-context.toml is missing or invalid.
+          owner=$(python3 scripts/project_context.py --repository-owner "${GITHUB_REPOSITORY%%/*}" --board-owner-or-skip)
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+
+      - name: Read the repository name
+        id: repo
+        # A schedule payload has no `repository`, so the App token's `repositories` cannot come from the event.
+        run: |
+          echo "name=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create optional board token
+        id: board-token
+        if: ${{ env.HAS_BOARD_APP == 'true' && steps.project-config.outputs.owner != '' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.PROJECT_STATUS_APP_ID }}
+          private-key: ${{ secrets.PROJECT_BOARD_APP_PRIVATE_KEY }}
+          owner: ${{ steps.project-config.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+          permission-issues: read
+          permission-organization-projects: write
+
+      # Phase issues only: tasks.md Phases become Story issues; T### tasks never become issues.
+      - name: Synchronize Phase issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # App token first; PROJECT_BOARD_TOKEN only once the project context is read.
+          BOARD_GH_TOKEN: ${{ steps.board-token.outputs.token || (steps.project-config.outputs.owner != '' && secrets.PROJECT_BOARD_TOKEN) || '' }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FEATURE_INPUT: ${{ inputs.feature }}
+          APPLY_REQUESTED: ${{ inputs.apply }}
+          AUTO_APPLY_ENABLED: ${{ vars.PHASE_SYNC_AUTO_APPLY }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "The workflow GITHUB_TOKEN is required." >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" || "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            # Scheduled and unfiltered manual runs reconcile every feature.
+            if [[ -n "$FEATURE_INPUT" ]]; then
+              features="$FEATURE_INPUT"
+            else
+              features=""
+              for tasks_file in specs/*/tasks.md; do
+                [[ -f "$tasks_file" ]] && features+="$(dirname "$tasks_file")"$'\n'
+              done
+            fi
+          else
+            # Features are the specs/<feature> directories whose tasks.md changed in the PR.
+            features=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' \
+              | sed -nE 's#^(specs/[^/]+)/tasks\.md$#\1#p' | sort -u)
+          fi
+          if [[ -z "$features" ]]; then
+            echo "No specs/<feature>/tasks.md to sync; nothing to do."
+            exit 0
+          fi
+
+          args=(--roadmap-only)
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            args+=(--apply)
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$APPLY_REQUESTED" == "true" ]]; then
+            args+=(--apply)
+          elif [[ "$GITHUB_EVENT_NAME" == "schedule" && "$AUTO_APPLY_ENABLED" == "true" ]]; then
+            args+=(--apply)
+          else
+            echo "Read-only preview; enable PHASE_SYNC_AUTO_APPLY only after reviewing the proposed full reconciliation."
+          fi
+          if [[ -z "$BOARD_GH_TOKEN" ]]; then
+            args+=(--skip-project)
+            echo "Board sync skipped (see notices above)."
+          fi
+
+          failed=0
+          while IFS= read -r feature; do
+            [[ -n "$feature" ]] || continue
+            if ! python3 scripts/sync-task-issues.py "${args[@]}" --feature "$feature"; then
+              echo "Failed to sync $feature; continuing with remaining features." >&2
+              failed=1
+            fi
+          done <<< "$features"
+          if [[ "$failed" == "1" ]]; then
+            exit 1
+          fi

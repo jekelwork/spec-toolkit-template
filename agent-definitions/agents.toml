@@ -1,0 +1,46 @@
+# Model and reasoning effort per sub-agent and tool, read by `python3 scripts/agent_setup.py sync`.
+# Model ids are tool-specific (Claude aliases do not work in Copilot). A missing key inherits the tool's session setting.
+
+[agents]
+code-reviewer = "critical-review"
+security-auditor = "critical-review"
+tdd-implementer = "implementation"
+test-engineer = "verification"
+web-performance-auditor = "default"
+
+[profiles.critical-review.claude]
+model = "opus"
+effort = "medium"
+[profiles.critical-review.copilot]
+model = "claude-opus-5.5"
+effort = "medium"
+[profiles.critical-review.codex]
+model = "gpt-5.6-sol"
+effort = "medium"
+
+[profiles.implementation.claude]
+model = "sonnet"
+effort = "medium"
+[profiles.implementation.copilot]
+model = "claude-sonnet-5.5"
+effort = "medium"
+[profiles.implementation.codex]
+model = "gpt-5.6-terra"
+effort = "medium"
+
+[profiles.verification.claude]
+model = "sonnet"
+effort = "medium"
+[profiles.verification.copilot]
+model = "claude-sonnet-5.5"
+effort = "medium"
+[profiles.verification.codex]
+model = "gpt-5.6-terra"
+effort = "medium"
+
+[profiles.default.claude]
+model = "sonnet"
+[profiles.default.copilot]
+model = "claude-sonnet-5.5"
+[profiles.default.codex]
+model = "gpt-5.6-terra"

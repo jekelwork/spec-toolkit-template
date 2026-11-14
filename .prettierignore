@@ -1,0 +1,8 @@
+node_modules
+package-lock.json
+dist
+build
+coverage
+
+# Markdown is hand-written; Prettier would rewrite emphasis markers, tables, and template front matter.
+*.md

@@ -1,0 +1,29 @@
+name: Roadmap dependency gate
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  roadmap-gate:
+    name: Roadmap prerequisites
+    runs-on: ubuntu-latest
+    concurrency:
+      group: roadmap-gate-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      # pull_request_target is privileged; execute only code from the trusted base.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Check roadmap prerequisites
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/roadmap_gate.py

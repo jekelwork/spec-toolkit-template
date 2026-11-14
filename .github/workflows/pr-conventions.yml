@@ -1,0 +1,96 @@
+name: PR conventions
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+
+jobs:
+  validate-and-link:
+    name: Validate branch and link issue
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pr-conventions-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      # pull_request_target has write access, so only execute trusted code from the base commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Parse branch name
+        id: branch
+        env:
+          BRANCH_NAME: ${{ github.event.pull_request.head.ref }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          changed_paths="$RUNNER_TEMP/pr-changed-paths"
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+            --jq '.[].filename' > "$changed_paths"
+          metadata=$(python3 scripts/pr_conventions.py parse-pr-branch "$BRANCH_NAME" \
+            --changed-paths-file "$changed_paths")
+          echo "branch-type=$(jq -r '.branch_type' <<< "$metadata")" >> "$GITHUB_OUTPUT"
+          echo "issue-number=$(jq -r '.issue_number // empty' <<< "$metadata")" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Spec Kit branch changes
+        if: steps.branch.outputs.branch-type == 'spec'
+        env:
+          BRANCH_NAME: ${{ github.event.pull_request.head.ref }}
+        run: |
+          python3 scripts/pr_conventions.py validate-spec-branch "$BRANCH_NAME" \
+            --changed-paths-file "$RUNNER_TEMP/pr-changed-paths"
+
+      - name: Validate linked issue
+        if: steps.branch.outputs.branch-type != 'spec'
+        env:
+          BRANCH_NAME: ${{ github.event.pull_request.head.ref }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.branch.outputs.issue-number }}
+        run: |
+          issue=$(gh issue view "$ISSUE_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json title,state)
+          python3 scripts/pr_conventions.py validate-issue "$BRANCH_NAME" \
+            --issue-title "$(jq -r '.title' <<< "$issue")" \
+            --issue-state "$(jq -r '.state' <<< "$issue")"
+
+      - name: Ensure PR links the issue (Phase PRs do not close their Phase)
+        if: steps.branch.outputs.branch-type != 'spec'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.branch.outputs.issue-number }}
+          PHASE_FLAG: ${{ steps.branch.outputs.branch-type == 'phase' && '--phase' || '' }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          current_body=$(mktemp)
+          updated_body=$(mktemp)
+          trap 'rm -f "$current_body" "$updated_body"' EXIT
+
+          gh pr view "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json body \
+            --jq '.body // ""' > "$current_body"
+
+          phase_args=()
+          if [[ -n "$PHASE_FLAG" ]]; then
+            phase_args=("$PHASE_FLAG")
+          fi
+          result=$(python3 scripts/pr_conventions.py update-body "$ISSUE_NUMBER" \
+            "${phase_args[@]}" \
+            --body-file "$current_body" \
+            --output-file "$updated_body" \
+            --repository "$REPOSITORY")
+
+          if [[ "$result" == "updated" ]]; then
+            gh pr edit "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body-file "$updated_body"
+          fi

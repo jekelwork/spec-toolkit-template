@@ -1,0 +1,21 @@
+node_modules/
+dist/
+build/
+coverage/
+*.log
+.env*
+.DS_Store
+__pycache__/
+.vscode/
+.idea/
+# Personal Claude Code settings; .claude/ itself holds the shared skills symlink
+.claude/settings.local.json
+*.tmp
+*.swp
+.specify/extensions/.cache/
+# Keep pre-existing local reports from the removed roadmap extension untracked.
+.specify/memory/roadmap-sync-*.md
+# Generated sub-agent files (python3 scripts/agent_setup.py sync); keep personal agents in ~/.claude/agents/
+.github/agents/
+.claude/agents/
+.codex/agents/

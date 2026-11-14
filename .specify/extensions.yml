@@ -1,0 +1,59 @@
+hooks:
+  before_tasks:
+    - extension: plan-merged
+      command: plan-merged.check
+      enabled: true
+      optional: false
+      priority: 10
+      description: Stop task generation unless the feature's spec.md and plan.md are
+        already merged to origin/main.
+  after_implement:
+    - extension: code-review-and-quality
+      command: code-review-and-quality
+      enabled: true
+      optional: false
+      priority: 20
+      description: Review the completed implementation for correctness, readability,
+        architecture, security, and performance. Safety net for direct speckit-implement
+        runs; work done by tdd-implementer is reviewed by the code-reviewer agent instead.
+  after_tasks:
+    - extension: speckit-analyze
+      command: speckit.analyze
+      enabled: true
+      optional: false
+      priority: 20
+      description: Run the read-only cross-artifact consistency analysis across spec.md,
+        plan.md, and tasks.md on the Phase 1 implementation branch after the initial
+        tasks.md generation.
+  after_specify:
+    - extension: speckit-clarify
+      command: speckit.clarify
+      enabled: true
+      optional: false
+      priority: 10
+      description: Clarify the new spec.md before planning (specify → clarify → plan).
+  before_specify:
+    - extension: roadmap-entry-check
+      command: roadmap-entry.check
+      enabled: true
+      optional: false
+      priority: 5
+      description: Validate the planned roadmap entry and explicit feature directory before specifying.
+  before_implement:
+    - extension: roadmap-dependency
+      command: roadmap-dependency.check
+      enabled: true
+      optional: false
+      priority: 5
+      description: Check roadmap prerequisites before implementing a feature.
+  after_constitution:
+    - extension: roadmap-write
+      command: roadmap.write
+      enabled: true
+      optional: true
+      priority: 10
+      prompt: Update the plan-only ROADMAP.md based on the constitution discussion?
+      description: Create or amend the root roadmap from confirmed project decisions.
+installed: []
+settings:
+  auto_execute_hooks: true

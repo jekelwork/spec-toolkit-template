@@ -1,0 +1,36 @@
+# Git hooks (pre-commit and pre-push only), installed by `npm ci` in the repository root (its `prepare` script runs `lefthook install`
+# and `python3 scripts/agent_setup.py sync`).
+pre-commit:
+  parallel: true
+  commands:
+    prettier:
+      # `stage_fixed` re-stages what Prettier changed. Lefthook hides the unstaged hunks of a partially
+      # staged file while the hook runs, so only the staged content is formatted and re-staged.
+      glob: '*.{yml,yaml}'
+      run: npx --no-install prettier --log-level warn --write {staged_files}
+      stage_fixed: true
+    secrets:
+      run: node scripts/check-secrets.mjs {staged_files}
+    agent-setup:
+      # Only the check (the same as CI), never sync: the generated files are git-ignored, so the commit
+      # does not need them. A commit that only deletes files does not trigger this hook; CI does.
+      glob:
+        - '.specify/**'
+        - '.agents/**'
+        - '.claude/**'
+        - '.codex/**'
+        - '.github/agents/**'
+        - 'agent-definitions/**'
+        - '.github/skills/**'
+        - 'scripts/agent_setup.py'
+      run: python3 scripts/agent_setup.py check
+pre-push:
+  scripts:
+    branch-name.sh:
+      # Checks branch syntax locally; the PR workflow also validates its issue or spec directory.
+      # .lefthook/pre-push/branch-name.sh reads Git's pre-push lines from stdin.
+      runner: sh
+      use_stdin: true
+# There are deliberately no post-checkout, post-merge or post-rewrite hooks: lefthook.yml and the scripts
+# come from the checked-out tree, so such a hook would run a branch's code just by checking it out.
+# After switching branches or pulling, run `python3 scripts/agent_setup.py sync` by hand.
