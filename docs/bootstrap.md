@@ -2,7 +2,7 @@
 
 ## What bootstrap is
 
-A repository created from the toolkit export starts "not initialized": it has no
+A repository created from the template starts "not initialized": it has no
 `project-context.toml`, constitution, `ROADMAP.md` or specs, and CI passes or skips with a notice.
 Bootstrap sets up your project's own governance and the GitHub settings the automation needs. The end
 state is a repository where:
@@ -28,15 +28,13 @@ action. It changes nothing, so run it whenever you are unsure.
 
 ## Quick start
 
-From the toolkit source, export it and publish it as the initial commit on `main`:
+Create your repository from the template and clone it:
 
 ```bash
-python3 scripts/export_toolkit.py --output ../my-project
-cd ../my-project
-git init -b main && git add -A && git commit -m "Initial toolkit export"
 # --public makes your code, specs and roadmap visible to everyone. Rulesets need a public
 # repository on GitHub Free; use --private only on Pro, Team or Enterprise.
-gh repo create <owner>/my-project --public --source . --push
+gh repo create <owner>/my-project --template jekelwork/spec-toolkit-template --public --clone
+cd my-project
 npm ci                                  # git hooks and agent files
 ```
 
@@ -57,13 +55,16 @@ gh pr create --fill
 
 Each step is explained below.
 
-## Create the repository from the export
+## Create the repository from the template
 
-Push the export as the initial commit on `main` **before** any ruleset exists: once the ruleset is
-active, `main` accepts only pull requests. `npm ci` runs the `prepare` script, which installs the Git
+`gh repo create --template` (or the **Use this template** button on GitHub, followed by `git clone`)
+creates your repository with the template's files as a single initial commit on `main`, with a fresh
+history. GitHub copies files only: labels, the ruleset, secrets and the board are set up by the
+bootstrap steps below. If the clone comes out empty because GitHub was still generating the
+repository, run `git fetch origin && git checkout main` in it. `npm ci` runs the `prepare` script, which installs the Git
 hooks and runs `python3 scripts/agent_setup.py sync` to generate the sub-agent files for Copilot,
-Claude Code and Codex (`npm run setup-agents` is the interactive way to limit them to the tools you use). Run it after
-`git init`, because the hooks need a Git repository. Restart your coding agent session afterwards so it
+Claude Code and Codex (`npm run setup-agents` is the interactive way to limit them to the tools you use). Run it in
+the clone, because the hooks need a Git repository. Restart your coding agent session afterwards so it
 loads the agents. Git does not regenerate the agent files on checkout, pull or rebase: run
 `python3 scripts/agent_setup.py sync` after switching branches (`bootstrap.py check` reports out-of-date agent
 files). When you review an untrusted pull request, do not run its code or install its dependencies;

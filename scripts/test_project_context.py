@@ -109,67 +109,26 @@ class ProjectContextTest(unittest.TestCase):
         self.assertNotEqual(mismatched.returncode, 0)
         self.assertIn("cross-owner Projects are not supported", mismatched.stderr)
 
-    def test_toolkit_export_source_is_optional_and_must_be_a_boolean(self):
-        enabled = self.run_with_config(VALID + "\n[toolkit]\nexport_source = true\n")
-        self.assertEqual(enabled.returncode, 0, enabled.stderr)
-        self.assertEqual(json.loads(enabled.stdout)["toolkit"], {"export_source": True})
-
-        for invalid, expected in (
-            (VALID + '\n[toolkit]\nexport_source = "yes"\n', "toolkit.export_source"),
-            (VALID + "\n[toolkit]\nexport_source = 1\n", "toolkit.export_source"),
-            (VALID + "\n[toolkit]\nother = true\n", "toolkit keys"),
-        ):
-            with self.subTest(content=invalid):
-                result = self.run_with_config(invalid)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(expected, result.stderr)
-
-    def test_toolkit_export_source_flag_prints_true_or_false(self):
-        for content, expected in (
-            (VALID + "\n[toolkit]\nexport_source = true\n", "true"),
-            (VALID + "\n[toolkit]\nexport_source = false\n", "false"),
-            (VALID, "false"),
-        ):
-            with self.subTest(expected=expected, content=content):
-                result = self.run_with_config(content, "--toolkit-export-source")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), expected)
-
-    def test_toolkit_export_source_flag_is_false_without_a_config_file(self):
-        # A freshly adopted repository has no project-context.toml yet; the workflow must skip, not fail.
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "missing.toml"
-            result = subprocess.run(
-                [sys.executable, str(SCRIPT), "--config", str(path), "--toolkit-export-source"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "false")
-
-    def test_toolkit_export_source_flag_still_rejects_an_invalid_config(self):
-        result = self.run_with_config("[project\n", "--toolkit-export-source")
+    def test_the_retired_toolkit_section_is_rejected(self):
+        result = self.run_with_config(VALID + "\n[toolkit]\nexport_source = true\n")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
+        self.assertIn("unknown sections: toolkit", result.stderr)
 
-    def test_example_config_does_not_enable_toolkit_export_source(self):
+    def test_the_retired_toolkit_export_source_flag_is_rejected(self):
+        result = self.run_with_config(VALID, "--toolkit-export-source")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unrecognized arguments: --toolkit-export-source", result.stderr)
+
+    def test_example_config_has_no_toolkit_section(self):
         example = SCRIPT.parent.parent / "project-context.example.toml"
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT), "--config", str(example), "--toolkit-export-source"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "false")
+        self.assertNotIn("toolkit", example.read_text(encoding="utf-8"))
 
     def test_unknown_or_missing_sections_are_named(self):
-        misspelled = self.run_with_config(VALID + "\n[tookit]\nexport_source = true\n")
+        misspelled = self.run_with_config(VALID + "\n[reveiw]\nrequired_approvals = 1\n")
         self.assertNotEqual(misspelled.returncode, 0)
-        self.assertIn("unknown sections: tookit", misspelled.stderr)
+        self.assertIn("unknown sections: reveiw", misspelled.stderr)
         self.assertIn("required sections: project, github_project", misspelled.stderr)
-        self.assertIn("optional sections: toolkit", misspelled.stderr)
+        self.assertIn("optional sections: review", misspelled.stderr)
 
         missing = self.run_with_config('[project]\nname = "Example"\ndescription = "x"\n')
         self.assertNotEqual(missing.returncode, 0)
@@ -229,9 +188,8 @@ class ReviewSettingTest(unittest.TestCase):
 class ExclusiveFlagsTest(unittest.TestCase):
     def test_mode_flags_cannot_be_combined(self):
         for flags in (
-            ("--toolkit-export-source", "--required-approvals"),
             ("--bootstrap-state", "--required-approvals"),
-            ("--bootstrap-state", "--toolkit-export-source"),
+            ("--bootstrap-state", "--board-owner-or-skip"),
         ):
             with self.subTest(flags=flags):
                 result = subprocess.run(

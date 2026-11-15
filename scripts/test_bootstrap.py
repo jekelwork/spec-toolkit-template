@@ -146,13 +146,12 @@ class EmitterTest(unittest.TestCase):
             "project": {"name": "n", "description": "d"},
             "github_project": {"owner": "acme", "number": 5},
             "review": {"required_approvals": 0},
-            "toolkit": {"export_source": True},
         }
         text = bootstrap.emit_toml(context)
         self.assertEqual(tomllib.loads(text), context)
-        order = [text.index(f"[{name}]") for name in ("project", "github_project", "review", "toolkit")]
+        order = [text.index(f"[{name}]") for name in ("project", "github_project", "review")]
         self.assertEqual(order, sorted(order))
-        self.assertIn("export_source = true", text)
+        self.assertIn("required_approvals = 0", text)
         self.assertTrue(text.endswith("\n"))
 
     def test_unsupported_values_are_refused(self):
@@ -196,11 +195,15 @@ class InitDefaultsTest(BootstrapTestCase):
         self.assertEqual(code, 0, self.err)
         self.assertEqual(self.written()["project"]["name"], "my-dir")
 
-    def test_toolkit_section_only_when_asked(self):
+    def test_init_writes_no_toolkit_section(self):
         self.init("--description", "D", "--project-number", "1")
         self.assertNotIn("toolkit", self.written())
-        self.init("--description", "D", "--project-number", "1", "--force", "--toolkit-export-source")
-        self.assertEqual(self.written()["toolkit"], {"export_source": True})
+
+    def test_the_retired_toolkit_export_source_option_is_rejected(self):
+        with self.assertRaises(SystemExit) as raised, contextlib.redirect_stderr(io.StringIO()):
+            self.init("--description", "D", "--project-number", "1", "--toolkit-export-source")
+        self.assertEqual(raised.exception.code, 2)
+        self.assertFalse(self.target.exists())
 
     def test_output_names_the_file_and_next_steps_without_slash_commands(self):
         self.init("--description", "D", "--project-number", "1")

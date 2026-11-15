@@ -8,13 +8,13 @@ import unittest
 
 
 WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/toolkit.yml"
-STEP_NAME = "Check the toolkit export manifest classifies every tracked file"
+RETIRED_EXPORT_STEP_NAME = "Check the toolkit export manifest classifies every tracked file"
 
 
 ROADMAP_STEP_NAME = "Check the roadmap format once the repository is initialized"
 
 
-def step_script(name=STEP_NAME, workflow=WORKFLOW):
+def step_script(name, workflow=WORKFLOW):
     """Return the `run` script of a step (plain text extraction, no YAML parser)."""
     text = workflow.read_text(encoding="utf-8")
     start = re.search(rf"^      - name: {re.escape(name)}\n", text, re.MULTILINE)
@@ -28,55 +28,12 @@ def step_script(name=STEP_NAME, workflow=WORKFLOW):
     return "\n".join(line[10:] for line in match.group(1).splitlines())
 
 
-def export_step_script():
-    return step_script()
-
-
-class ToolkitWorkflowExportStepTest(unittest.TestCase):
-    def run_step(self, query_script):
-        """Run the step under `bash -e` (GitHub's default shell) with stubbed scripts."""
-        with tempfile.TemporaryDirectory() as directory:
-            scripts = Path(directory) / "scripts"
-            scripts.mkdir()
-            (scripts / "project_context.py").write_text(query_script, encoding="utf-8")
-            (scripts / "export_toolkit.py").write_text(
-                'print("EXPORT CHECK RAN")\n', encoding="utf-8"
-            )
-            return subprocess.run(
-                ["bash", "-e", "-c", export_step_script()],
-                cwd=directory,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-
-    def test_check_runs_only_for_the_toolkit_source(self):
-        result = self.run_step('print("true")\n')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("EXPORT CHECK RAN", result.stdout)
-        self.assertNotIn("::notice::", result.stdout)
-
-    def test_check_is_skipped_with_a_notice_elsewhere(self):
-        result = self.run_step('print("false")\n')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("EXPORT CHECK RAN", result.stdout)
-        self.assertIn("::notice::", result.stdout)
-        self.assertIn("not the toolkit source", result.stdout)
-
-    def test_an_invalid_project_context_fails_the_step(self):
-        result = self.run_step('import sys\nprint("invalid", file=sys.stderr)\nsys.exit(1)\n')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn("::notice::", result.stdout)
-        self.assertNotIn("EXPORT CHECK RAN", result.stdout)
-
-    def test_unexpected_output_fails_the_step(self):
-        for output in ("TRUE", "true ", "noise\ntrue", "", "yes"):
-            with self.subTest(output=output):
-                result = self.run_step(f"print({output!r})\n")
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn("::error::", result.stdout)
-                self.assertNotIn("::notice::", result.stdout)
-                self.assertNotIn("EXPORT CHECK RAN", result.stdout)
+class RetiredExportStepTest(unittest.TestCase):
+    def test_the_retired_export_check_is_gone(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn(RETIRED_EXPORT_STEP_NAME, text)
+        self.assertNotIn("export_toolkit.py", text)
+        self.assertNotIn("--toolkit-export-source", text)
 
 
 APP_TOKEN_STEPS = (
@@ -170,6 +127,63 @@ class ToolkitWorkflowRoadmapStepTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("::error::", result.stdout)
                 self.assertNotIn("ROADMAP CHECK RAN", result.stdout)
+
+
+TEMPLATE_STEP_NAME = "Keep the template uninitialized"
+
+
+class TemplateStaysUninitializedStepTest(unittest.TestCase):
+    """The template repository must never ship project files; repositories created from it skip this."""
+
+    def run_step(self, state_script):
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = Path(directory) / "scripts"
+            scripts.mkdir()
+            (scripts / "project_context.py").write_text(state_script, encoding="utf-8")
+            return subprocess.run(
+                ["bash", "-e", "-c", step_script(TEMPLATE_STEP_NAME)],
+                cwd=directory,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+    def test_it_runs_only_in_a_repository_marked_as_a_template(self):
+        condition = step_condition("toolkit.yml", TEMPLATE_STEP_NAME)
+        self.assertEqual(condition, "github.event.repository.is_template")
+        self.assertTrue(evaluate(condition, {"github.event.repository.is_template": True}))
+        self.assertFalse(evaluate(condition, {"github.event.repository.is_template": False}))
+
+    def test_it_runs_before_the_roadmap_check(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertLess(
+            text.index(f"- name: {TEMPLATE_STEP_NAME}\n"),
+            text.index(f"- name: {ROADMAP_STEP_NAME}\n"),
+        )
+
+    def test_an_uninitialized_template_passes(self):
+        result = self.run_step('print("uninitialized")\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("::error::", result.stdout)
+
+    def test_an_initialized_template_fails_and_names_the_files(self):
+        result = self.run_step('print("initialized")\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("::error::", result.stdout)
+        self.assertIn("must stay uninitialized", result.stdout)
+        for name in ("project-context.toml", "ROADMAP.md", "constitution", "specs/"):
+            self.assertIn(name, result.stdout)
+
+    def test_a_failing_state_query_fails_the_step(self):
+        result = self.run_step("import sys\nsys.exit(1)\n")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_unexpected_output_fails_the_step(self):
+        for output in ("UNINITIALIZED", "uninitialized ", "noise\nuninitialized", "", "yes"):
+            with self.subTest(output=output):
+                result = self.run_step(f"print({output!r})\n")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("::error::", result.stdout)
 
 
 WORKFLOWS = WORKFLOW.parent
