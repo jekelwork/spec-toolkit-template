@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bootstrap a repository created from the toolkit export (see docs/bootstrap.md).
+"""Bootstrap a repository created from the template (see docs/bootstrap.md).
 
 Subcommands (no subcommand runs check):
   check   report where you are and what to do next (read-only)
@@ -266,8 +266,6 @@ def init(args, root, run, is_tty, prompt):
         "github_project": {"owner": owner, "number": number if number is not None else 1},
         "review": {"required_approvals": approvals},
     }
-    if args.toolkit_export_source:
-        context["toolkit"] = {"export_source": True}
     validate(context)  # before any board is created
     check_writable(root)
     if create:
@@ -310,9 +308,6 @@ def build_parser():
     init_parser.add_argument("--force", action="store_true", help="overwrite an existing file")
     init_parser.add_argument(
         "--yes", action="store_true", help="never prompt; use defaults for missing values"
-    )
-    init_parser.add_argument(
-        "--toolkit-export-source", action="store_true", help=argparse.SUPPRESS
     )
     github_parser = commands.add_parser(
         "github", help="preview, apply or check labels, board and branch ruleset"

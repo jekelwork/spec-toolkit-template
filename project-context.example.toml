@@ -12,8 +12,3 @@ number = 123
 # the same number in the constitution's approval rule.
 # [review]
 # required_approvals = 1
-
-# Optional. Set to true only in the repository that is the source of the exported
-# toolkit; it makes the Toolkit workflow check scripts/toolkit-export.toml.
-# [toolkit]
-# export_source = false

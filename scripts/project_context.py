@@ -28,7 +28,6 @@ SCHEMA = {
     "github_project": {"owner", "number"},
 }
 OPTIONAL_SCHEMA = {
-    "toolkit": {"export_source"},
     "review": {"required_approvals"},
 }
 DEFAULT_REQUIRED_APPROVALS = 1
@@ -138,15 +137,6 @@ def load_context(path):
     number = context["github_project"]["number"]
     if type(number) is not int or number < 1:
         raise ValueError("github_project.number must be a positive integer")
-    if "toolkit" in context:
-        toolkit = context["toolkit"]
-        if not isinstance(toolkit, dict):
-            raise ValueError("toolkit must be a table")
-        unknown = toolkit.keys() - OPTIONAL_SCHEMA["toolkit"]
-        if unknown:
-            raise ValueError(f"unknown toolkit keys: {', '.join(sorted(unknown))}")
-        if "export_source" in toolkit and type(toolkit["export_source"]) is not bool:
-            raise ValueError("toolkit.export_source must be a boolean")
     if "review" in context:
         review = context["review"]
         if not isinstance(review, dict):
@@ -163,11 +153,6 @@ def load_context(path):
 def required_approvals(context):
     """Independent approvals a pull request needs; 0 is a solo project, absent means 1."""
     return context.get("review", {}).get("required_approvals", DEFAULT_REQUIRED_APPROVALS)
-
-
-def is_toolkit_export_source(context):
-    """True only in the toolkit's source repository; absent means false."""
-    return context.get("toolkit", {}).get("export_source", False)
 
 
 def validate_repository_owner(context, repository_owner):
@@ -195,11 +180,6 @@ def main():
     )
     parser.add_argument(
         "--root", type=Path, default=ROOT, help="repository root for --bootstrap-state"
-    )
-    modes.add_argument(
-        "--toolkit-export-source",
-        action="store_true",
-        help="print true or false for toolkit.export_source (false when the file is missing)",
     )
     modes.add_argument(
         "--required-approvals",
@@ -239,9 +219,6 @@ def main():
             print(f"Cannot determine the bootstrap state: {error}", file=sys.stderr)
             return 1
         return 0
-    if args.toolkit_export_source and not args.config.exists():
-        print("false")
-        return 0
     if not args.config.exists():
         print(missing_context_message(args.config), file=sys.stderr)
         return 1
@@ -252,9 +229,6 @@ def main():
     except (OSError, tomllib.TOMLDecodeError, ValueError) as error:
         print(f"Invalid project context TOML {args.config}: {error}", file=sys.stderr)
         return 1
-    if args.toolkit_export_source:
-        print("true" if is_toolkit_export_source(context) else "false")
-        return 0
     if args.required_approvals:
         print(required_approvals(context))
         return 0

@@ -2,7 +2,7 @@
 
 ## bootstrap.py
 
-One entry point for setting up a repository created from the toolkit export; see
+One entry point for setting up a repository created from the template; see
 [`docs/bootstrap.md`](../docs/bootstrap.md). `check` (also what a plain
 `bootstrap.py` runs), `init` and `github`:
 
@@ -103,7 +103,7 @@ contains `review` only when the section is present.
 marker files are `project-context.toml`, `ROADMAP.md`,
 `.specify/memory/constitution.md` and any feature directory under `specs/`. A
 repository is **uninitialized** only while none of them exists, which is what a
-fresh toolkit export looks like. Any one of them makes it **initialized**, so a
+fresh repository created from the template looks like. Any one of them makes it **initialized**, so a
 half-initialized repository (for example a `specs/` directory without
 `ROADMAP.md`) fails the roadmap checks with an error naming the missing
 `ROADMAP.md` and the step that creates it, and a missing `project-context.toml`
@@ -121,108 +121,17 @@ Project-specific scope, technology and quality requirements live in the
 applying those requirements; changing the context file does not weaken the
 constitution or existing review and workflow gates.
 
-## export_toolkit.py
+## Repositories created from the template
 
-Exports the project-neutral toolkit (skills, sub-agents, Spec Kit scripts,
-workflows, scripts and their docs) from a **committed git ref** so it can be
-reused in another project. The file list, the contents and, unless `--manifest` is given,
-the manifest itself are read from git objects at the ref, never the working
-tree, so uncommitted edits cannot leak into an export (the script warns once,
-listing the included paths that have uncommitted changes, including both sides
-of a staged rename). Git is run without `GIT_*` environment variables, so a
-git hook cannot point it at another repository. The one call that reads the
-worktree (`git status`) runs with `core.fsmonitor=false`, so the repository's
-own config cannot run an fsmonitor command. Not protected: other git config and
-the exported content itself; export only from a repository you trust (see below).
-
-```bash
-python3 scripts/export_toolkit.py --check                   # validate the manifest, write nothing
-python3 scripts/export_toolkit.py --list                    # exported paths, sorted
-python3 scripts/export_toolkit.py --output ../new-project   # write a tree (dir must be new or empty)
-python3 scripts/export_toolkit.py --tarball ../toolkit.tar.gz  # same content, one top-level directory
-python3 scripts/export_toolkit.py --ref <ref> --list        # default ref is HEAD
-```
-
-The modes are mutually exclusive and one is required. `--output` and
-`--tarball` refuse a destination inside this repository (symlinks and `..`
-components are resolved by the operating system first, so aliases and
-differently cased paths are caught too), the current directory, a path ending in
-`.` or `..`, a non-empty directory or an existing file. Executable bits are
-preserved; a directory export applies your umask to file modes, a tarball
-always uses 0644/0755 so it stays deterministic (byte-identical for the same
-ref). Exports are written to a temporary sibling and moved into place at the
-end; on failure the temporary files and any parent directories the script
-created are removed.
-
-The script refuses: submodules; non-UTF-8 paths; tree paths with an empty, `.`,
-`..` or `.git` component (also with Unicode default-ignorable characters
-inside, as git's `core.protectHFS` ignores them), a backslash or any control
-character; paths that collide when case-folded; and every symlink the manifest
-does not declare. The manifest's `[symlinks]` table lists the only allowed
-symlinks with their exact targets (today `.claude/skills` to
-`../.agents/skills`); a declared symlink must exist at the ref, be a symlink
-with exactly that target, be exported, and resolve to an exported file or
-directory. Targets are resolved by exact string steps: a target may not pass
-through another declared symlink, and paths below a declared symlink are
-refused. `*` and `**` also match dotfiles. After writing, every created symlink is checked to resolve inside the
-export. `--manifest PATH` uses another manifest instead of the one committed at
-the ref (tests do).
-
-An export is code the receiving project runs (npm lifecycle scripts, git hooks,
-`scripts/`, workflows). Export only from a reviewed ref on `main`.
-
-The manifest is [`toolkit-export.toml`](toolkit-export.toml) with `include` and
-`exclude` glob lists (semantics are in its header: `*` stays within one path
-segment, a whole-segment `**` crosses directories and `**` inside a segment is
-like `*`, patterns are anchored at the repository root and matched segment by
-segment, so matching stays fast; invalid patterns are errors). Exclude wins over include. Every tracked path must match one of the two
-lists; an unclassified path fails `--check` and lists every such path, so a new
-file needs an explicit decision.
-
-The Toolkit workflow runs `--check` only in the toolkit's source repository,
-the one whose `project-context.toml` sets `export_source = true` in an optional
-`[toolkit]` table (a boolean; absent means false). `project-context.toml` is
-excluded from the export, so adopters never inherit the key; there the step
-prints a `::notice::` and is skipped, as it also is while `project-context.toml`
-does not exist yet. Query the value with
-`python3 scripts/project_context.py --toolkit-export-source` (prints `true` or
-`false`). `scripts/test_toolkit_source_guard.py` fails if this repository's
-`project-context.toml` stops setting `export_source = true`, so a pull request
-cannot quietly switch the export check off; it is excluded from the export
-because it applies only to the toolkit's source repository (a clean-slate
-`project-context.toml` here must keep the flag).
-
-Excluded as product governance that each project replaces: `specs/**`,
-`ROADMAP.md`, `project-brief.md`, `project-context.toml`,
-`constitution-prompt-proposal.md`, the constitution and its template state,
-`docs/handoff-*.md` and `.github/CODEOWNERS` (it names a team handle).
-`project-brief.md` and `constitution-prompt-proposal.md` are this repository's
-own governance files; they are not exported, and an adopting project writes
-its own if needed.
-`.specify/workflows/workflow-registry.json` is excluded too: it is an empty Spec
-Kit workflow registry, and `.specify/workflows/` is not part of this process.
-
-To verify an export, export to a directory outside the repository, commit it in
-a fresh repository and run the toolkit checks there:
-
-```bash
-dir=$(mktemp -d)/toolkit-check
-python3 scripts/export_toolkit.py --output "$dir"
-cd "$dir" && git init && git add -A && git commit -m "Export"
-python3 -m unittest discover -s scripts -p 'test_*.py'
-node --test scripts/check-secrets.test.mjs
-python3 scripts/agent_setup.py check
-```
-
-A fresh export's `README.md` and `AGENTS.md` still link to `ROADMAP.md`,
-`specs/`, `project-context.toml` and the constitution, which the new project
-creates during bootstrap. The export is in the not-yet-initialized state (see
-[`project_context.py`](#not-yet-initialized-state)): `check_roadmap.py`,
-`roadmap_status.py` and `sync-roadmap-issues.py` print `Not initialized yet: no
-ROADMAP.md. See docs/bootstrap.md.` and exit 0, and the Toolkit workflow skips
-the roadmap check with a `::notice::`. `scripts/test_fresh_export.py` exports the
-working tree into a temporary repository and asserts this end to end. Run the
-tests with `python3 -m unittest scripts.test_export_toolkit scripts.test_fresh_export`.
+A new project is created from the
+[jekelwork/spec-toolkit-template](https://github.com/jekelwork/spec-toolkit-template) template (see
+[`docs/bootstrap.md`](../docs/bootstrap.md)). The template is kept in the not-yet-initialized
+state (see [`project_context.py`](#not-yet-initialized-state)): it has no `ROADMAP.md`, `specs/`,
+`project-context.toml` or constitution, so every new repository starts there too. Its `README.md`
+and `AGENTS.md` still link to those files, which the new project creates during bootstrap.
+Until then `check_roadmap.py`, `roadmap_status.py` and `sync-roadmap-issues.py` print
+`Not initialized yet: no ROADMAP.md. See docs/bootstrap.md.` and exit 0, and the Toolkit workflow
+skips the roadmap check with a `::notice::`.
 
 The board workflows skip with a `::notice::` instead of failing while
 the repository is not initialized (no `project-context.toml` yet) or no board
