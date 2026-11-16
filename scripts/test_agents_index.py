@@ -48,7 +48,10 @@ def section_rows():
     header, _separator, *body = rows
     cells = [c.strip() for c in header.strip("|").split("|")]
     if cells != ["Question", "Where to look"]:
-        raise AssertionError(f"Unexpected table header: {cells}")
+        raise AssertionError(
+            f"Unexpected table header {cells}; the index table header must be exactly "
+            "'| Question | Where to look |' (see docs/bootstrap.md#troubleshooting)"
+        )
     return body
 
 
@@ -107,7 +110,11 @@ def rel_path(target):
 class AgentsIndexTest(unittest.TestCase):
     def test_section_has_a_compact_table(self):
         # The index stays compact; a longer list is no longer a quick pointer.
-        self.assertTrue(10 <= len(section_rows()) <= 16)
+        count = len(section_rows())
+        self.assertTrue(
+            10 <= count <= 16,
+            f"the index has {count} rows; keep 10 to 16 (see docs/bootstrap.md#troubleshooting)",
+        )
 
     def test_every_row_links_somewhere_or_names_a_command(self):
         for row in section_rows():
@@ -134,7 +141,12 @@ class AgentsIndexTest(unittest.TestCase):
                 continue
             path = ROOT / path_part if path_part else AGENTS
             self.assertEqual(path.suffix, ".md", f"anchor on non-Markdown {target}")
-            self.assertIn(anchor, anchors(path), f"no heading for {target}")
+            self.assertIn(
+                anchor,
+                anchors(path),
+                f"no heading for {target}; fix the anchor, or the heading it points to "
+                "(see docs/bootstrap.md#troubleshooting)",
+            )
 
     def test_no_link_to_an_export_excluded_file(self):
         for row, target in targets():
