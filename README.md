@@ -10,6 +10,8 @@ This repository is built on the spec-driven development toolkit from the [jekelw
 
 Run these steps once per clone, in the repository root, before your first commit.
 
+0. Create your repository from the template, unless you already have one. Do not clone the template repository directly. Follow [docs/bootstrap.md](docs/bootstrap.md), or run `gh repo create <owner>/<name> --template jekelwork/spec-toolkit-template --public --clone`. Bootstrap then sets up your project's governance and GitHub settings.
+
 1. Install the Git hooks (see [Git hooks](#git-hooks)) and generate the sub-agent files:
 
    ```bash
