@@ -219,6 +219,8 @@ def init(args, root, run, is_tty, prompt):
 
     remote = remote_defaults(root, run)
 
+    defaulted = set()
+
     def resolve(value, label, flag, default=None):
         if value is not None:
             return value
@@ -228,6 +230,7 @@ def init(args, root, run, is_tty, prompt):
             if answer:
                 return answer
         if default is not None:
+            defaulted.add(flag)
             return default
         raise ValueError(f"{label} is required: pass {flag}")
 
@@ -255,7 +258,7 @@ def init(args, root, run, is_tty, prompt):
             )
     approvals = resolve(
         args.required_approvals, "Required approvals (0 for a solo project)",
-        "--required-approvals", project_context.DEFAULT_REQUIRED_APPROVALS,
+        "--required-approvals", 0,
     )
     try:
         approvals = int(approvals)
@@ -282,6 +285,11 @@ def init(args, root, run, is_tty, prompt):
             ) from error
         raise
     print(f"Wrote {target}")
+    if "--required-approvals" in defaulted and approvals == 0:
+        print(
+            "Notice: required_approvals = 0 (solo project). "
+            "A team project must pass --required-approvals 1 or more."
+        )
     print()
     print(NEXT_STEPS)
 
@@ -303,7 +311,12 @@ def build_parser():
         "--create-board", action="store_true", help="create the board with `gh project create`"
     )
     init_parser.add_argument(
-        "--required-approvals", type=int, help="independent approvals per pull request (default 1)"
+        "--required-approvals",
+        type=int,
+        help="independent approvals per pull request (default 0, a solo project; "
+        "use the number your constitution sets). "
+        "A team project must set at least 1; 0 lets any member merge their own "
+        "pull request without review.",
     )
     init_parser.add_argument("--force", action="store_true", help="overwrite an existing file")
     init_parser.add_argument(

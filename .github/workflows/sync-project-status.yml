@@ -73,6 +73,8 @@ jobs:
       - name: Reconcile statuses
         if: ${{ steps.project-config.outputs.owner != '' }}
         env:
+          # Unbuffered, so a failure prints in order with the script output in the log.
+          PYTHONUNBUFFERED: '1'
           # Repository reads use the workflow token; only Project calls use the board credential.
           GH_TOKEN: ${{ github.token }}
           BOARD_GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.PROJECT_BOARD_TOKEN }}

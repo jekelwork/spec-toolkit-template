@@ -8,13 +8,16 @@ import check_roadmap
 import check_roadmap_dependencies as dependencies
 
 
+ENTRY_FIELDS = {
+    "Description": "A test entry",
+    "Outcome": "A validated roadmap",
+    "Scope (in)": "Format validation",
+    "Depends on": "none",
+}
+
+
 def roadmap_entry(number="900", title="Example", status="planned", fields=None):
-    values = fields or {
-        "Description": "A test entry",
-        "Outcome": "A validated roadmap",
-        "Scope (in)": "Format validation",
-        "Depends on": "none",
-    }
+    values = fields or dict(ENTRY_FIELDS)
     return (
         f"### {number} — {title}  [status: {status}]\n"
         + "".join(f"- **{name}:** {value}\n" for name, value in values.items())
@@ -193,6 +196,131 @@ class CheckRoadmapTest(unittest.TestCase):
                 result = check_roadmap.main(["--root", str(root)])
             self.assertEqual(result, 1)
             self.assertIn("directory prefix does not match roadmap entry 901", errors.getvalue())
+
+
+class ValidatorMessageCharacterizationTest(unittest.TestCase):
+    """Pin exact validator messages and line numbers across the shared entry loop."""
+
+    SECTION = "## Planned Specs\n"
+
+    def assert_message(self, text, message):
+        with self.assertRaises(dependencies.InvalidData) as caught:
+            check_roadmap.validate_roadmap_text(text)
+        self.assertEqual(str(caught.exception), message)
+
+    def test_ambiguous_depends_on_continuation(self):
+        self.assert_message(
+            self.SECTION + roadmap_entry() + "lazy text\n",
+            "900: ambiguous Depends on continuation at line 7",
+        )
+
+    def test_missing_required_field(self):
+        fields = {k: v for k, v in ENTRY_FIELDS.items() if k != "Outcome"}
+        self.assert_message(
+            self.SECTION + roadmap_entry(fields=fields),
+            "900: missing required field 'Outcome'",
+        )
+
+    def test_missing_depends_on_field(self):
+        fields = {k: v for k, v in ENTRY_FIELDS.items() if k != "Depends on"}
+        self.assert_message(
+            self.SECTION + roadmap_entry(fields=fields),
+            "900: missing or empty Depends on field",
+        )
+
+    def test_bad_spec_dir(self):
+        fields = {**ENTRY_FIELDS, "Spec dir": "specs/999-x/"}
+        self.assert_message(
+            self.SECTION + roadmap_entry(fields=fields),
+            "900: Spec dir prefix must be specs/900-<slug>/",
+        )
+
+    def test_duplicate_entry_id(self):
+        self.assert_message(
+            self.SECTION + roadmap_entry() + roadmap_entry(),
+            "line 7: duplicate entry ID 900",
+        )
+
+    def test_entry_heading_outside_section(self):
+        self.assert_message(
+            roadmap_entry("901") + self.SECTION + roadmap_entry(),
+            "line 1: entry heading outside Planned Specs",
+        )
+
+    def test_unknown_field(self):
+        self.assert_message(
+            self.SECTION + roadmap_entry() + "- **Bogus:** x\n",
+            "line 7: unknown roadmap field 'Bogus'",
+        )
+
+    def test_duplicate_and_empty_field(self):
+        for tail, message in (
+            ("- **Outcome:** again\n", "line 7: duplicate 'Outcome' field in 900"),
+            ("- **Notes:**\n", "line 7: empty 'Notes' field in 900"),
+        ):
+            with self.subTest(tail=tail):
+                self.assert_message(self.SECTION + roadmap_entry() + tail, message)
+
+    def test_field_outside_entry(self):
+        self.assert_message(
+            self.SECTION + roadmap_entry() + "### Other\n- **Outcome:** x\n",
+            "line 8: roadmap field outside an entry",
+        )
+
+    def test_ambiguous_depends_on_continuation_after_a_blank_line(self):
+        self.assert_message(
+            self.SECTION + roadmap_entry() + "\nlazy text\n",
+            "900: ambiguous Depends on continuation at line 8",
+        )
+
+    def test_field_after_a_fence_inside_notes_is_still_a_field(self):
+        self.assert_message(
+            self.SECTION + roadmap_entry()
+            + "- **Notes:** n\n```\ncode\n```\n- **Outcome:** again\n",
+            "line 11: duplicate 'Outcome' field in 900",
+        )
+
+    def test_field_after_a_level_four_heading_is_outside_an_entry(self):
+        self.assert_message(
+            self.SECTION + roadmap_entry() + "#### Sub\n- **Outcome:** x\n",
+            "line 8: roadmap field outside an entry",
+        )
+
+    def test_comments_are_invisible_and_raw_html_is_rejected(self):
+        cases = (
+            ("comment", "<!-- c -->\n- **Bogus:** x\n", "line 8: unknown roadmap field 'Bogus'"),
+            ("unclosed comment", "<!-- c\n", "unclosed HTML comment; close the comment and retry"),
+            (
+                "raw HTML",
+                "<b>x</b>\n",
+                "line 7: unsupported raw HTML; remove it or use a fenced code example",
+            ),
+        )
+        for name, tail, message in cases:
+            with self.subTest(name):
+                self.assert_message(self.SECTION + roadmap_entry() + tail, message)
+
+
+class HeadingEndsActiveFieldTest(unittest.TestCase):
+    """A field in one entry must not continue into the next entry's lazy text."""
+
+    TEXT = (
+        "## Planned Specs\n"
+        + roadmap_entry(fields={**ENTRY_FIELDS, "Notes": "n"})
+        + "### 901 \u2014 Two  [status: planned]\n"
+        + "lazy 1\n"
+        + "".join(f"- **{k}:** {v}\n" for k, v in ENTRY_FIELDS.items())
+    )
+
+    def test_validator_keeps_the_next_entry_notes_empty(self):
+        entries = check_roadmap.validate_roadmap_text(self.TEXT)
+        self.assertEqual(entries["900"]["notes"], "n")
+        self.assertEqual(entries["901"]["notes"], "")
+
+    def test_sync_parser_does_not_continue_the_previous_field(self):
+        entries = dependencies.parse_entry_fields(self.TEXT)
+        self.assertEqual(entries["900"]["fields"]["Notes"], "n")
+        self.assertEqual(entries["901"]["fields"], ENTRY_FIELDS)
 
 
 class UninitializedRepositoryTest(unittest.TestCase):

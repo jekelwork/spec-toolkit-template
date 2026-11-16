@@ -18,7 +18,7 @@ API = f"repos/{OWNER}/{REPO}"
 # Made-up roadmap entry (ID 900) so the tests never depend on the live ROADMAP.md.
 FIXTURE_ROADMAP = """# Roadmap
 
-## Entries
+## Planned Specs
 
 ### 900 — Issue Tracking (API)  [status: planned]
 
@@ -77,6 +77,10 @@ class FakeGitHub:
         self.project_owner_kind = project_owner_kind
         self.login = login
         self.has_roadmap_order = True
+        # GitHub's built-in "Auto-add sub-issues to project" workflow, on for new boards.
+        self.auto_add_sub_issues = False
+        self.pending_auto_adds = set()
+        self.hidden_items = set()
         names = ("Backlog", "Planned", "In progress", "In review", "Done")
         self.option_ids = {name: f"opt-{name}" for name in names}
         self._check = True
@@ -226,9 +230,22 @@ class FakeGitHub:
             if "addProjectV2ItemById" in query:
                 assert fields["projectId"] == "PVT_project"
                 number = int(fields["contentId"].rsplit("_", 1)[1])
+                if number in self.project_items:
+                    # GitHub refuses a second add (for example after its built-in "Auto-add
+                    # sub-issues to project" workflow already added the issue).
+                    message = "Content already exists in this project"
+                    body = {"data": {"addProjectV2ItemById": None},
+                            "errors": [{"type": "UNPROCESSABLE", "message": message}]}
+                    return self._result(1, stdout=json.dumps(body),
+                                        stderr=f"gh: {message}", args=args, check=self._check)
                 item = self.project_items.setdefault(
                     number, {"id": f"PVTI_{number}", "status": None, "order": None}
                 )
+                if self.auto_add_sub_issues:
+                    # GitHub adds the sub-issues a moment later, after the sync's own lookup.
+                    self.pending_auto_adds.update(
+                        child for child, parent in self.parents.items() if parent == number
+                    )
                 return self._result(stdout=json.dumps(
                     {"data": {"addProjectV2ItemById": {"item": {"id": item["id"]}}}}))
             if "deleteProjectV2Item" in query:
@@ -269,7 +286,17 @@ class FakeGitHub:
                                     '{"projectV2Item":{"id":"' + item_id + '"}}}}')
             number = int(fields["number"])
             nodes = []
-            if number in self.project_items:
+            if number in self.pending_auto_adds:
+                self.pending_auto_adds.discard(number)
+                # GitHub keeps an item that is already on the board.
+                if number not in self.project_items:
+                    self.project_items[number] = {
+                        "id": f"PVTI_{number}", "status": None, "order": None,
+                    }
+                    self.hidden_items.add(number)
+            if number in self.hidden_items:
+                self.hidden_items.discard(number)  # this one read still sees nothing
+            elif number in self.project_items:
                 item = self.project_items[number]
                 status = {"name": item["status"]} if item["status"] else None
                 order = {"number": item["order"]} if item["order"] is not None else None
@@ -320,6 +347,8 @@ class FakeGitHub:
             if child["number"] in self.parents and fields.get("replace_parent") != "true":
                 return self._result(1, stderr="already has a parent (HTTP 422)", args=args)
             self.parents[child["number"]] = number
+            if self.auto_add_sub_issues and number in self.project_items:
+                self.pending_auto_adds.add(child["number"])
             return self._result(stdout=f"{number}\n")
         if rest == "/dependencies/blocked_by":
             if method == "POST":

@@ -31,24 +31,22 @@ def validate_roadmap_text(text):
         text, entries, statuses=roadmap_issues.PLAN_STATUSES
     )
     fields_by_id = {}
-    current_id = None
 
-    for line_number, line, _ in dependencies.visible_section_lines(text):
-        if re.match(r"^ {0,3}#{1,6}\s", line):
-            heading = dependencies.HEADING.fullmatch(line)
-            current_id = heading.group(1) if heading else None
-            if current_id:
-                fields_by_id[current_id] = {}
+    for item in dependencies.iter_entry_lines(text):
+        if item.is_heading:
+            if item.heading:
+                fields_by_id[item.heading.group(1)] = {}
             continue
 
-        field = dependencies.FIELD.fullmatch(line)
-        if FIELD_MARKER.match(line) and field is None:
+        field, line_number = item.field, item.number
+        if FIELD_MARKER.match(item.text) and field is None:
             raise dependencies.InvalidData(
                 f"line {line_number}: malformed roadmap field; use "
                 "'- **Field name:** value'"
             )
         if not field:
             continue
+        current_id = item.entry_id
         if current_id is None:
             raise dependencies.InvalidData(
                 f"line {line_number}: roadmap field outside an entry"

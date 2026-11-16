@@ -17,7 +17,15 @@ description = "An example project"
 [github_project]
 owner = "example-org"
 number = 123
+
+[review]
+required_approvals = 1
 """
+NO_REVIEW = VALID.split("\n[review]")[0] + "\n"
+MISSING_REVIEW_MESSAGE = (
+    "add `[review] required_approvals = N`, using the number of independent approvals your "
+    "constitution's Git workflow principle sets (0 for a solo project)"
+)
 
 
 class ProjectContextTest(unittest.TestCase):
@@ -40,6 +48,7 @@ class ProjectContextTest(unittest.TestCase):
             {
                 "project": {"name": "Example", "description": "An example project"},
                 "github_project": {"owner": "example-org", "number": 123},
+                "review": {"required_approvals": 1},
             },
         )
 
@@ -124,16 +133,15 @@ class ProjectContextTest(unittest.TestCase):
         self.assertNotIn("toolkit", example.read_text(encoding="utf-8"))
 
     def test_unknown_or_missing_sections_are_named(self):
-        misspelled = self.run_with_config(VALID + "\n[reveiw]\nrequired_approvals = 1\n")
+        misspelled = self.run_with_config(NO_REVIEW + "\n[reveiw]\nrequired_approvals = 1\n")
         self.assertNotEqual(misspelled.returncode, 0)
         self.assertIn("unknown sections: reveiw", misspelled.stderr)
-        self.assertIn("required sections: project, github_project", misspelled.stderr)
-        self.assertIn("optional sections: review", misspelled.stderr)
+        self.assertIn("required sections: project, github_project, review", misspelled.stderr)
 
         missing = self.run_with_config('[project]\nname = "Example"\ndescription = "x"\n')
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn("missing sections: github_project", missing.stderr)
-        self.assertIn("required sections: project, github_project", missing.stderr)
+        self.assertIn("required sections: project, github_project, review", missing.stderr)
 
 
 class ReviewSettingTest(unittest.TestCase):
@@ -148,31 +156,63 @@ class ReviewSettingTest(unittest.TestCase):
                 check=False,
             )
 
-    def test_review_is_optional_and_appears_in_the_json_when_set(self):
-        result = self.run_with_config(VALID + "\n[review]\nrequired_approvals = 0\n")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["review"], {"required_approvals": 0})
+    def test_explicit_zero_and_one_are_accepted(self):
+        for count in (0, 1):
+            with self.subTest(count=count):
+                result = self.run_with_config(NO_REVIEW + f"\n[review]\nrequired_approvals = {count}\n")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["review"], {"required_approvals": count})
 
-    def test_required_approvals_flag_prints_the_value_or_the_default(self):
-        for content, expected in (
-            (VALID, "1"),
-            (VALID + "\n[review]\n", "1"),
-            (VALID + "\n[review]\nrequired_approvals = 0\n", "0"),
-            (VALID + "\n[review]\nrequired_approvals = 2\n", "2"),
-        ):
-            with self.subTest(content=content):
-                result = self.run_with_config(content, "--required-approvals")
+    def test_missing_review_section_is_an_error(self):
+        result = self.run_with_config(NO_REVIEW)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(MISSING_REVIEW_MESSAGE, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_missing_required_approvals_key_is_an_error(self):
+        result = self.run_with_config(NO_REVIEW + "\n[review]\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(MISSING_REVIEW_MESSAGE, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_required_approvals_flag_prints_the_explicit_value(self):
+        for expected in ("0", "1", "2"):
+            with self.subTest(expected=expected):
+                result = self.run_with_config(
+                    NO_REVIEW + f"\n[review]\nrequired_approvals = {expected}\n", "--required-approvals"
+                )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
+        result = self.run_with_config(NO_REVIEW, "--required-approvals")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_help_and_example_warn_that_a_team_needs_one_or_more(self):
+        sentence = "A team project must set at least 1; 0 lets any member merge their own pull request without review."
+        example = (SCRIPT.parent.parent / "project-context.example.toml").read_text(encoding="utf-8")
+        self.assertIn(" ".join(sentence.split()), " ".join(example.replace("# ", "").split()))
+        helped = subprocess.run(
+            [sys.executable, str(SCRIPT.with_name("bootstrap.py")), "init", "--help"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(helped.returncode, 0, helped.stderr)
+        self.assertIn(" ".join(sentence.split()), " ".join(helped.stdout.split()))
+
+    def test_example_config_states_zero_and_points_to_the_constitution(self):
+        text = (SCRIPT.parent.parent / "project-context.example.toml").read_text(encoding="utf-8")
+        self.assertIn("required_approvals = 0", text)
+        self.assertIn("constitution", text)
+        self.assertNotIn("# required_approvals", text)
+
     def test_invalid_review_settings_are_rejected(self):
         for invalid, expected in (
-            (VALID + "\n[review]\nrequired_approvals = true\n", "review.required_approvals"),
-            (VALID + "\n[review]\nrequired_approvals = -1\n", "review.required_approvals"),
-            (VALID + '\n[review]\nrequired_approvals = "1"\n', "review.required_approvals"),
-            (VALID + "\n[review]\nrequired_approvals = 1.5\n", "review.required_approvals"),
-            (VALID + "\n[review]\nrequired_reviewers = 1\n", "review keys"),
-            (VALID + "\nreview = 1\n", "review"),
+            (NO_REVIEW + "\n[review]\nrequired_approvals = true\n", "review.required_approvals"),
+            (NO_REVIEW + "\n[review]\nrequired_approvals = -1\n", "review.required_approvals"),
+            (NO_REVIEW + '\n[review]\nrequired_approvals = "1"\n', "review.required_approvals"),
+            (NO_REVIEW + "\n[review]\nrequired_approvals = 1.5\n", "review.required_approvals"),
+            (NO_REVIEW + "\n[review]\nrequired_reviewers = 1\n", "review keys"),
+            (NO_REVIEW + "\nreview = 1\n", "review"),
         ):
             with self.subTest(content=invalid):
                 result = self.run_with_config(invalid)
@@ -327,6 +367,13 @@ class BoardOwnerOrSkipTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("::error::Missing project context", result.stderr)
         self.assertIn("python3 scripts/bootstrap.py init", result.stderr)
+
+    def test_once_initialized_a_missing_review_section_is_an_error(self):
+        result = self.run_mode(app="true", files=("ROADMAP.md",), config=NO_REVIEW)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.startswith("::error::"), result.stderr)
+        self.assertIn(MISSING_REVIEW_MESSAGE, result.stderr)
 
     def test_it_prints_the_owner_and_names_the_credential_in_use(self):
         for app, pat, used, other in (

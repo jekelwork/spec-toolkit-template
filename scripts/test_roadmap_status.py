@@ -23,6 +23,9 @@ description = "An example project"
 [github_project]
 owner = "example-org"
 number = 123
+
+[review]
+required_approvals = 0
 """
 
 
@@ -116,12 +119,13 @@ class RoadmapStatusTest(unittest.TestCase):
             ["901"],
         )
 
-    def run_command(self, argv, issues=(), failure=None, board_failure=None, text=None):
+    def run_command(self, argv, issues=(), failure=None, board_failure=None, text=None,
+                    context_text=PROJECT_CONTEXT):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ROADMAP.md"
             path.write_text(text if text is not None else roadmap_text(), encoding="utf-8")
             context = Path(directory) / "project-context.toml"
-            context.write_text(PROJECT_CONTEXT, encoding="utf-8")
+            context.write_text(context_text, encoding="utf-8")
             output, errors = io.StringIO(), io.StringIO()
             with (
                 patch.object(roadmap_status.sync.project_context, "DEFAULT_CONFIG", context),
@@ -145,6 +149,15 @@ class RoadmapStatusTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(json.loads(output)["result"], "error")
         self.assertIn("API permission denied", output)
+
+    def test_a_missing_review_value_warns_with_the_fix_and_stays_non_fatal(self):
+        code, output, errors = self.run_command(
+            ["--json"], [epic()], context_text=PROJECT_CONTEXT.split("\n[review]")[0] + "\n"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(json.loads(output)), 2)
+        self.assertIn("Warning: roadmap board configuration unavailable", errors)
+        self.assertIn("[review] required_approvals = N", errors)
 
     def test_optional_board_failure_is_visible_not_required_data_failure(self):
         code, output, errors = self.run_command(

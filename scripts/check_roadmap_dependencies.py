@@ -2,6 +2,7 @@
 """Historical file-status checker and shared parser; use roadmap_status.py for live gates."""
 
 import argparse
+from collections import namedtuple
 import json
 import re
 import string
@@ -305,19 +306,87 @@ def visible_section_lines(text):
     return lines
 
 
+EntryLine = namedtuple(
+    'EntryLine', 'number text example is_heading heading entry_id active field'
+)
+EntryLine.__doc__ = """One visible Planned Specs line with its entry and field context.
+
+`number` is the 1-based source line number and `text` the visible line (comments removed).
+`example` is True for a line holding only a single code span, such as a quoted
+`- **Field:** value` example; the validator treats those inside Notes as text, not fields.
+`heading` is the HEADING match for an entry heading (None for other headings).
+`entry_id` is the entry the line sits in and `active` the field in effect, both before this
+line. `field` is the FIELD match of a field line (None for headings).
+"""
+
+
+def iter_entry_lines(text):
+    """Yield an EntryLine per visible section line: the one loop deciding entries and fields.
+
+    A heading of any level ends the entry and its active field; an entry heading starts a
+    new one. A field line inside an entry becomes the active field. Consumers decide what
+    continuations, errors and values mean.
+    """
+    entry_id = None
+    active = None
+    for line_number, line, example in visible_section_lines(text):
+        if re.match(r'^ {0,3}#{1,6}\s', line):
+            heading = HEADING.fullmatch(line)
+            yield EntryLine(line_number, line, example, True, heading, entry_id, active, None)
+            entry_id = heading.group(1) if heading else None
+            active = None
+            continue
+        field = FIELD.match(line)
+        yield EntryLine(line_number, line, example, False, None, entry_id, active, field)
+        if field and entry_id is not None:
+            active = field.group(1)
+
+
+def parse_entry_fields(text):
+    """Return {ID: {id, title, status, fields}} with each field's full joined text.
+
+    Built on `iter_entry_lines`: any non-field line continues the active field, blank lines
+    are skipped, and a heading ends the entry. It checks only what that needs, inside the
+    validator's own `## Planned Specs` section (entries elsewhere are rejected, as the
+    validator does); check_roadmap.py does the strict validation.
+    """
+    entries = {}
+    current = None
+    for item in iter_entry_lines(text):
+        if item.is_heading:
+            current = None
+            if item.heading:
+                number, title, status = item.heading.groups()
+                if number in entries:
+                    raise InvalidData(f'line {item.number}: duplicate entry ID {number}')
+                current = {'id': number, 'title': title.strip(), 'status': status, 'fields': {}}
+                entries[number] = current
+            continue
+        if current is None:
+            continue
+        if item.field:
+            current['fields'][item.field.group(1)] = (item.field.group(2) or '').strip()
+        elif item.active and item.text.strip():
+            current['fields'][item.active] = (
+                f"{current['fields'][item.active]} {item.text.strip()}".strip()
+            )
+    return entries
+
+
 def parse_roadmap(text, entries, *, statuses=STATUSES):
     current = None
-    active_field = None
     unknown_field = None
-    for line_number, line, code_example in visible_section_lines(text):
+    for item in iter_entry_lines(text):
+        line_number, line, code_example, active_field = (
+            item.number, item.text, item.example, item.active
+        )
         if re.match(r'^ {0,3}#{1,6}[ \t]*[0-9]', line):
             if not HEADING.fullmatch(line):
                 raise InvalidData(f'line {line_number}: malformed entry heading or status: {line}')
-        if re.match(r'^ {0,3}#{1,6}\s', line):
+        if item.is_heading:
             current = None
-            active_field = None
             unknown_field = None
-            match = HEADING.fullmatch(line)
+            match = item.heading
             if match:
                 number, title, status = match.groups()
                 if not title.strip() or '[status:' in title:
@@ -347,7 +416,7 @@ def parse_roadmap(text, entries, *, statuses=STATUSES):
                         normalized_label(example_field.group('label'))))))):
                 current['notes'] += '\n' + line
                 continue
-        field = FIELD.match(line)
+        field = item.field
         canonical_peer = field and field.group(1) in KNOWN_FIELDS
         if unknown_field and not canonical_peer:
             reference = ROADMAP_REFERENCE.search(line)
@@ -428,7 +497,6 @@ def parse_roadmap(text, entries, *, statuses=STATUSES):
         if field:
             name, value = field.groups()
             value = value or ''
-            active_field = name
             if name.lower().strip() == 'depends on' and name != 'Depends on':
                 raise InvalidData(f"{current['id']}: malformed Depends on field at line {line_number}")
             if name == 'Depends on':
@@ -444,8 +512,6 @@ def parse_roadmap(text, entries, *, statuses=STATUSES):
             current['notes'] += '\n' + line
         elif active_field == 'Depends on' and line.strip():
             raise InvalidData(f"{current['id']}: ambiguous Depends on continuation at line {line_number}")
-        elif line.strip():
-            active_field = None
 
     if not entries:
         raise InvalidData('no roadmap entries found; check the roadmap headings')

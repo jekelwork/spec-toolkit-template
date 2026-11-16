@@ -483,6 +483,15 @@ class RulesetTest(GitHubTestCase):
             [(name, 15368) for name in bootstrap_github.REQUIRED_CHECKS],
         )
 
+    def test_creating_a_ruleset_with_zero_approvals_prints_a_notice(self):
+        notice = "Note: the new ruleset requires no independent approval for the main branch"
+        self.write_context(0)
+        _, out, _ = self.github(FakeGitHub(), "--apply")
+        self.assertIn(notice, out)
+        self.write_context(1)
+        _, out, _ = self.github(FakeGitHub(), "--apply")
+        self.assertNotIn(notice, out)
+
     def test_approval_counts_zero_one_and_two(self):
         for approvals, last_push in ((0, False), (1, True), (2, True)):
             self.write_context(approvals)
@@ -602,6 +611,17 @@ class RulesetTest(GitHubTestCase):
         self.assertEqual([call for call in run.writes if "-X" in call], [])
         parameters = self.rule(run, "pull_request")["parameters"]
         self.assertEqual(parameters["required_approving_review_count"], 2)
+
+    def test_lowering_from_one_to_zero_is_refused_without_allow_weaken(self):
+        run = FakeGitHub()
+        self.existing(run, approvals=1)
+        self.write_context(0)
+        code, out, _ = self.github(run, "--apply")
+        self.assertEqual(code, 0)
+        self.assertIn("Warning: required approvals 1 → 0 (rerun with --allow-weaken to apply)", out)
+        self.assertEqual([call for call in run.writes if "-X" in call], [])
+        parameters = self.rule(run, "pull_request")["parameters"]
+        self.assertEqual(parameters["required_approving_review_count"], 1)
 
     def test_refused_weakening_is_drift_under_check(self):
         run = FakeGitHub()

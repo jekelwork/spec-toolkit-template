@@ -6,8 +6,10 @@ Calls `gh` through sync-task-issues.py's helper, so tests patch `project_board.s
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import sys
+import time
 
 SCRIPTS = Path(__file__).resolve().parent
 
@@ -34,6 +36,12 @@ def project_gh(*args, **kwargs):
         return sync.gh(*args, env=dict(sync.ENV, GH_TOKEN=token), **kwargs)
     return sync.gh(*args, **kwargs)
 
+
+# gh exits non-zero and GitHub's GraphQL error text is the only signal that the item already
+# exists in the project.
+ALREADY_IN_PROJECT = re.compile(r"content already exists in this project", re.IGNORECASE)
+LOOKUP_ATTEMPTS = 3
+LOOKUP_DELAY_SECONDS = 3
 
 PROJECT_ITEMS_QUERY = """
 query($owner: String!, $repo: String!, $number: Int!) {
@@ -164,6 +172,10 @@ def find_project(owner, number):
     sys.exit(f"No project {number} found for user or organization {owner!r}{detail}")
 
 
+def _sleep(seconds):
+    time.sleep(seconds)
+
+
 def add_issue_to_project(owner, repo, number, project):
     """Add the issue to the Project (its id is looked up once and cached) and return the item id."""
     project_id, _ = project.project_fields()
@@ -185,8 +197,25 @@ def add_issue_to_project(owner, repo, number, project):
         sys.exit(f"Cannot look up issue #{number} in {owner}/{repo}: {error_cause(body, issue)}")
     added = project_gh(
         "api", "graphql", "-f", f"query={ADD_ITEM_MUTATION}",
-        "-f", f"projectId={project_id}", "-f", f"contentId={found['id']}",
+        "-f", f"projectId={project_id}", "-f", f"contentId={found['id']}", check=False,
     )
+    if added.returncode != 0:
+        # GitHub's built-in "Auto-add sub-issues to project" workflow may have added the issue
+        # already; that is the goal, so return its item. Any other refusal still fails.
+        cause = error_cause(parse_body(added.stdout), added)
+        # The match is on text because there is no error code to test for.
+        if ALREADY_IN_PROJECT.search(f"{cause}\n{added.stderr}"):
+            for attempt in range(LOOKUP_ATTEMPTS):
+                if attempt:
+                    _sleep(LOOKUP_DELAY_SECONDS)
+                item = project_item(owner, repo, number, project.owner, project.number)
+                if item:
+                    return item[0]
+            sys.exit(
+                f"GitHub reports issue #{number} is already in project "
+                f"{project.owner}/{project.number}, but it is not visible yet; rerun the sync"
+            )
+        sys.exit(f"Cannot add issue #{number} to project {project.owner}/{project.number}: {cause}")
     return json.loads(added.stdout)["data"]["addProjectV2ItemById"]["item"]["id"]
 
 

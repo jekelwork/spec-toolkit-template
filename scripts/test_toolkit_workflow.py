@@ -8,7 +8,7 @@ import unittest
 
 
 WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/toolkit.yml"
-RETIRED_EXPORT_STEP_NAME = "Check the toolkit export manifest classifies every tracked file"
+OLD_EXPORT_STEP_NAME = "Check the toolkit export manifest classifies every tracked file"
 
 
 ROADMAP_STEP_NAME = "Check the roadmap format once the repository is initialized"
@@ -28,10 +28,12 @@ def step_script(name, workflow=WORKFLOW):
     return "\n".join(line[10:] for line in match.group(1).splitlines())
 
 
-class RetiredExportStepTest(unittest.TestCase):
-    def test_the_retired_export_check_is_gone(self):
+class SourceOnlyExportToolingTest(unittest.TestCase):
+    """The export tooling is source-only: the published workflow must not call it."""
+
+    def test_the_published_workflow_does_not_call_the_export_tooling(self):
         text = WORKFLOW.read_text(encoding="utf-8")
-        self.assertNotIn(RETIRED_EXPORT_STEP_NAME, text)
+        self.assertNotIn(OLD_EXPORT_STEP_NAME, text)
         self.assertNotIn("export_toolkit.py", text)
         self.assertNotIn("--toolkit-export-source", text)
 
@@ -127,6 +129,51 @@ class ToolkitWorkflowRoadmapStepTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("::error::", result.stdout)
                 self.assertNotIn("ROADMAP CHECK RAN", result.stdout)
+
+
+CONTEXT_STEP_NAME = "Validate the project context once the repository is initialized"
+
+
+class ToolkitWorkflowContextStepTest(unittest.TestCase):
+    def run_step(self, state, context_exit=0):
+        """Run the step under `bash -e` with a stubbed project_context.py."""
+        stub = (
+            "import sys\n"
+            f'if "--bootstrap-state" in sys.argv:\n    print({state!r})\n    sys.exit(0)\n'
+            f'print("CONTEXT VALIDATED")\n'
+            f'print("STUB CONTEXT ERROR", file=sys.stderr)\nsys.exit({context_exit})\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = Path(directory) / "scripts"
+            scripts.mkdir()
+            (scripts / "project_context.py").write_text(stub, encoding="utf-8")
+            return subprocess.run(
+                ["bash", "-e", "-c", step_script(CONTEXT_STEP_NAME)],
+                cwd=directory, capture_output=True, text=True, check=False,
+            )
+
+    def test_the_context_is_validated_once_initialized(self):
+        result = self.run_step("initialized")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("CONTEXT VALIDATED", result.stdout)
+
+    def test_an_invalid_context_fails_the_step_once_initialized(self):
+        result = self.run_step("initialized", context_exit=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("STUB CONTEXT ERROR", result.stderr)
+        self.assertNotIn("CONTEXT VALIDATED", result.stdout)
+
+    def test_the_step_is_skipped_in_the_uninitialized_template(self):
+        result = self.run_step("uninitialized", context_exit=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("STUB CONTEXT ERROR", result.stderr)
+        self.assertIn("::notice::", result.stdout)
+
+    def test_unexpected_state_output_fails_the_step(self):
+        result = self.run_step("INITIALIZED")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("::error::", result.stdout)
+        self.assertNotIn("CONTEXT VALIDATED", result.stdout)
 
 
 TEMPLATE_STEP_NAME = "Keep the template uninitialized"
@@ -483,6 +530,17 @@ def secret_interpolations_in_run(text):
         if re.search(r"\$\{\{\s*secrets\.", "\n".join(body)):
             found.append("\n".join(body))
     return found
+
+
+class UnbufferedSyncStepTest(unittest.TestCase):
+    def test_python_sync_steps_print_unbuffered(self):
+        for workflow, step in (
+            ("sync-roadmap-issues.yml", "Synchronize roadmap issues"),
+            ("sync-spec-tasks.yml", "Synchronize Phase issues"),
+            ("sync-project-status.yml", "Reconcile statuses"),
+        ):
+            with self.subTest(workflow=workflow):
+                self.assertEqual("'1'", env_expression(workflow, step, "PYTHONUNBUFFERED"))
 
 
 class BoardCredentialTest(unittest.TestCase):
