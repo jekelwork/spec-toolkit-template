@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import importlib.util
 import io
 import re
@@ -13,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_github import FakeGitHub, OWNER, REPO  # noqa: E402
 # Importing project_board registers sync_task_issues in sys.modules, which the import below relies on.
 import project_board  # noqa: E402
+import check_roadmap  # noqa: E402
+import check_roadmap_dependencies  # noqa: E402
 import roadmap_issues  # noqa: E402
 import sync_task_issues  # noqa: E402
 
@@ -20,6 +23,17 @@ SCRIPT_PATH = Path(__file__).with_name("sync-roadmap-issues.py")
 SPEC = importlib.util.spec_from_file_location("sync_roadmap_issues", SCRIPT_PATH)
 sync_roadmap_issues = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(sync_roadmap_issues)
+
+
+class SpecPlanBodyTest(unittest.TestCase):
+    def test_approval_line_keeps_the_solo_project_caveat(self):
+        body = roadmap_issues.spec_plan_body({"id": "008", "title": "Example"}, "specs/008-example")
+        text = " ".join(body.split())
+        self.assertIn("required, no implicit default; the constitution wins", text)
+        self.assertIn("0 is valid only where the constitution allows a solo project", text)
+
+
+SECTION = "# Roadmap\n\n## Planned Specs\n\n"
 
 
 def roadmap_entry(roadmap_id, title, status="planned", depends="", spec_dir=""):
@@ -30,6 +44,12 @@ def roadmap_entry(roadmap_id, title, status="planned", depends="", spec_dir=""):
 - **Depends on:** {depends}
 - **Spec dir:** {spec_dir}
 """
+
+
+ENTRY_910 = (
+    "### 910 — T  [status: planned]\n\n- **Description:** D.\n- **Outcome:** O.\n"
+    "- **Scope (in):** S.\n- **Depends on:** none\n- **Notes:** N.\n"
+)
 
 
 class RoadmapIssueSyncTest(unittest.TestCase):
@@ -49,7 +69,7 @@ class RoadmapIssueSyncTest(unittest.TestCase):
         )
 
     def write_roadmap(self, text):
-        (self.root / "ROADMAP.md").write_text("# Roadmap\n\n" + text, encoding="utf-8")
+        (self.root / "ROADMAP.md").write_text(SECTION + text, encoding="utf-8")
         (self.root / "specs").mkdir(exist_ok=True)
 
     def test_non_plan_status_is_rejected_before_any_github_mutation(self):
@@ -60,6 +80,36 @@ class RoadmapIssueSyncTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.run_sync("--apply")
         self.assertEqual(self.fake.issues, {})
+
+    def assert_exits_untouched(self, breakage, expected):
+        self.run_sync("--apply")
+        roadmap = self.root / "ROADMAP.md"
+        working = roadmap.read_text(encoding="utf-8")
+        epic = self.find(roadmap_issues.roadmap_marker("900"))
+        before = copy.deepcopy(self.fake.issues)
+        self.assertEqual("open", epic["state"])
+        mutations_before = list(self.fake.mutations())
+
+        roadmap.write_text(breakage(working), encoding="utf-8")
+        with self.assertRaises(SystemExit) as raised:
+            self.run_sync("--apply")
+
+        self.assertIn(expected, str(raised.exception))
+        self.assertEqual(mutations_before, self.fake.mutations())
+        self.assertEqual(before, self.fake.issues)
+        self.assertEqual("open", self.find(roadmap_issues.roadmap_marker("900"))["state"])
+
+    def test_unclosed_comment_exits_without_github_calls(self):
+        self.assert_exits_untouched(lambda text: text + "<!-- never closed\n", "unclosed HTML comment")
+
+    def test_raw_html_exits_without_github_calls(self):
+        self.assert_exits_untouched(lambda text: text + "<div>x</div>\n", "unsupported raw HTML")
+
+    def test_entry_under_archive_exits_without_github_calls(self):
+        self.assert_exits_untouched(
+            lambda text: text + "\n## Archive\n\n" + ENTRY_910.replace("910", "906"),
+            "outside Planned Specs",
+        )
 
     def test_planned_completed_epic_is_not_reopened_or_duplicated(self):
         self.run_sync("--apply", "--id", "900")
@@ -114,7 +164,8 @@ class RoadmapIssueSyncTest(unittest.TestCase):
         context = self.root / "project-context.toml"
         context.write_text(
             '[project]\nname = "Example"\ndescription = "An example project"\n\n'
-            '[github_project]\nowner = "example-org"\nnumber = 123\n',
+            '[github_project]\nowner = "example-org"\nnumber = 123\n\n'
+            '[review]\nrequired_approvals = 0\n',
             encoding="utf-8",
         )
         with (
@@ -184,6 +235,20 @@ class RoadmapIssueSyncTest(unittest.TestCase):
                                      if "900" in i["body"] or "specs/900" in i["body"]]))
         self.assertEqual({self.find(roadmap_issues.roadmap_marker("901"))["number"]},
                          self.fake.blockers[epic["number"]])
+
+    def test_sync_renders_wrapped_fields_and_updates_existing_epic_body(self):
+        self.write_roadmap(WRAPPED_ENTRY)
+        self.run_sync("--apply")
+        epic = self.find(roadmap_issues.roadmap_marker("910"))
+        self.assertIn("wraps onto a second line and a third line.", epic["body"])
+        self.assertIn("- **Notes:** Note start note end.", epic["body"])
+
+        self.write_roadmap(WRAPPED_ENTRY.replace("note end.", "revised ending."))
+        self.run_sync("--apply")
+
+        epic = self.find(roadmap_issues.roadmap_marker("910"))
+        self.assertIn("- **Notes:** Note start revised ending.", epic["body"])
+        self.assertNotIn("note end.", epic["body"])
 
     def test_renamed_roadmap_entry_keeps_the_provisional_phase_1_issue(self):
         self.run_sync("--id", "900", "--apply")
@@ -500,6 +565,39 @@ class RoadmapIssueSyncTest(unittest.TestCase):
             all(self.fake.project_items[issue["number"]]["order"] is None
                 for issue in first_planning)
         )
+
+    def test_sync_survives_github_auto_adding_sub_issues_to_the_board(self):
+        self.fake.auto_add_sub_issues = True
+
+        self.run_sync("--apply", skip_project=False)
+
+        epic = self.find(roadmap_issues.roadmap_marker("900"))
+        phase1 = self.phase1()
+        planning = [
+            self.find(roadmap_issues.planning_marker("900", key))
+            for key, _ in roadmap_issues.PLANNING
+        ]
+        auto_added = [phase1, *planning]
+        self.assertTrue(
+            all(issue["number"] in self.fake.project_items for issue in auto_added)
+        )
+        self.assertEqual("Planned", self.fake.project_items[phase1["number"]]["status"])
+        self.assertEqual(1, self.fake.project_items[epic["number"]]["order"])
+
+    def test_sync_survives_auto_add_of_a_sub_issue_linked_under_an_epic_on_the_board(self):
+        self.run_sync("--apply", skip_project=False)
+        self.fake.auto_add_sub_issues = True
+        old = self.phase1()
+        # The provisional Phase 1 is lost, so a later sync creates a new one under the Epic.
+        for table in (self.fake.issues, self.fake.parents, self.fake.project_items):
+            table.pop(old["number"], None)
+        self.fake.blockers.pop(old["number"], None)
+
+        self.run_sync("--apply", skip_project=False)
+
+        new = self.phase1()
+        self.assertNotEqual(old["number"], new["number"])
+        self.assertEqual("Planned", self.fake.project_items[new["number"]]["status"])
 
     def test_project_items_are_still_added_when_order_field_is_missing(self):
         self.write_roadmap(roadmap_entry("900", "Planned Feature"))
@@ -996,6 +1094,249 @@ class RoadmapIssueSyncTest(unittest.TestCase):
 
         self.assertEqual(1, run.call_count)
         self.assertEqual(1, result.returncode)
+
+
+WRAPPED_ENTRY = """### 910 — Wrapped Feature  [status: planned]
+
+- **Description:** First part of the description
+  that wraps onto a second line
+    and a third line.
+- **Outcome:** Short outcome.
+- **Scope (in):** Included work
+  continues here.
+
+  A blank line is skipped.
+- **Depends on:** none
+- **Spec dir:** `specs/910-wrapped-feature/`
+- **Notes:** Note start
+  note end.
+"""
+
+
+class WrappedFieldTest(unittest.TestCase):
+    def parse(self):
+        return roadmap_issues.parse_roadmap(SECTION + WRAPPED_ENTRY)["910"]
+
+    def test_indented_continuation_lines_join_with_single_spaces(self):
+        fields = self.parse()["fields"]
+        self.assertEqual(
+            "First part of the description that wraps onto a second line and a third line.",
+            fields["Description"],
+        )
+        self.assertEqual("Included work continues here. A blank line is skipped.", fields["Scope (in)"])
+        self.assertEqual("Note start note end.", fields["Notes"])
+
+    def test_following_fields_still_parse(self):
+        entry = self.parse()
+        self.assertEqual("none", entry["fields"]["Depends on"])
+        self.assertEqual("specs/910-wrapped-feature", entry["spec_dir"])
+        self.assertEqual("Short outcome.", entry["fields"]["Outcome"])
+
+    def test_heading_ends_a_field_and_stray_text_is_ignored(self):
+        text = WRAPPED_ENTRY + "\n## Other\n  stray indented text\n"
+        fields = roadmap_issues.parse_roadmap(SECTION + text)["910"]["fields"]
+        self.assertEqual("Note start note end.", fields["Notes"])
+
+    def test_fenced_code_is_dropped_from_a_field(self):
+        text = (
+            SECTION + "### 910 — T  [status: planned]\n\n- **Description:** D.\n"
+            "- **Depends on:** none\n- **Notes:** Before.\n  ```sh\n  run this\n  ```\n  After.\n"
+        )
+        entry = roadmap_issues.parse_roadmap(text)["910"]
+        self.assertEqual("Before. After.", entry["fields"]["Notes"])
+        self.assertNotIn("```", roadmap_issues.roadmap_epic_body(entry, {}))
+
+    def test_epic_body_has_wrapped_text_and_notes_after_governed_by(self):
+        text = WRAPPED_ENTRY.replace(
+            "- **Spec dir:**", "- **Governed by:** the constitution\n- **Spec dir:**"
+        )
+        entry = roadmap_issues.parse_roadmap(SECTION + text)["910"]
+        body = roadmap_issues.roadmap_epic_body(entry, {})
+        self.assertIn("that wraps onto a second line and a third line.", body)
+        self.assertIn("- **Notes:** Note start note end.", body)
+        self.assertLess(body.index("**Governed by:**"), body.index("**Notes:**"))
+
+    def test_epic_body_notes_follow_depends_on_when_no_governed_by(self):
+        entry = self.parse()
+        body = roadmap_issues.roadmap_epic_body(entry, {})
+        self.assertLess(body.index("**Depends on:**"), body.index("**Notes:**"))
+
+
+def two_entries(notes):
+    def entry(number, extra=""):
+        return (
+            f"### {number} — T{number}  [status: planned]\n\n- **Description:** D.\n"
+            f"- **Outcome:** O.\n- **Scope (in):** S.\n- **Depends on:** none\n{extra}\n"
+        )
+
+    return entry("910", notes) + entry("911")
+
+
+class ParserAgreementTest(unittest.TestCase):
+    FIXTURES = {
+        "wrapped entry": (WRAPPED_ENTRY, {"Description": "First part of the description that wraps onto a second line and a third line."}),
+        "notes with two paragraphs": (
+            "### 910 — T  [status: planned]\n\n- **Description:** D.\n- **Outcome:** O.\n- **Scope (in):** S.\n- **Depends on:** none\n"
+            "- **Notes:** First paragraph.\n\n  Second paragraph.\n",
+            {},
+        ),
+        "fenced block in notes": (
+            "### 910 — T  [status: planned]\n\n- **Description:** D.\n- **Outcome:** O.\n- **Scope (in):** S.\n- **Depends on:** none\n"
+            "- **Notes:** Before code.\n  ```sh\n  run this\n  ```\n  After code.\n",
+            {},
+        ),
+        "inline triple-backtick span in notes": (
+            two_entries("- **Notes:** see\n  ```x```\n  more.\n"), {}),
+        "four-backtick fence holding a three-backtick line": (
+            two_entries("- **Notes:** a\n  ````\n  ```\n  inner\n  ````\n  b\n"), {}),
+        "tilde fence": (two_entries("- **Notes:** a\n  ~~~\n  code\n  ~~~\n  b\n"), {}),
+        "level 4 heading ends the entry": (
+            two_entries("- **Notes:** a\n#### Sub\nprose after\n"), {}),
+        "lazy continuation in notes": (
+            "### 910 — T  [status: planned]\n\n- **Description:** D.\n- **Outcome:** O.\n- **Scope (in):** S.\n- **Depends on:** none\n"
+            "- **Notes:** Start of note\nlazy end of note.\n",
+            {},
+        ),
+        "lazy continuation in description": (
+            "### 910 — T  [status: planned]\n\n- **Description:** Start of description\nlazy end of it.\n"
+            "- **Outcome:** O.\n- **Scope (in):** S.\n- **Depends on:** none\n- **Notes:** N.\n",
+            {"Description": "Start of description lazy end of it."},
+        ),
+    }
+
+    def test_sync_parser_matches_the_validator_on_continuations(self):
+        for name, (body, expected_fields) in self.FIXTURES.items():
+            with self.subTest(name):
+                text = "# Roadmap\n\n## Planned Specs\n\n" + body
+                check_roadmap.validate_roadmap_text(text)
+                entries = {}
+                check_roadmap_dependencies.parse_roadmap(text, entries)
+                synced = roadmap_issues.parse_roadmap(text)["910"]["fields"]
+                self.assertEqual(list(entries), list(roadmap_issues.parse_roadmap(text)))
+                self.assertEqual(
+                    " ".join(entries["910"]["notes"].split()),
+                    " ".join(synced["Notes"].split()),
+                )
+                for field, value in expected_fields.items():
+                    self.assertEqual(value, synced[field])
+                self.assertEqual("none", synced["Depends on"])
+
+
+CHARACTERIZATION_ROADMAP = """# Roadmap
+
+## Planned Specs
+
+<!-- a comment
+spanning lines -->
+### 910 — First  [status: planned]
+
+- **Description:** One <!-- inline --> two
+  three.
+- **Outcome:** O.
+- **Scope (in):** S.
+- **Scope (out):** Nothing.
+- **Depends on:** none
+- **Governed by:** the constitution
+- **Spec dir:** `specs/910-custom/`
+- **Notes:** Start.
+
+  ```sh
+  hidden
+  ```
+  End `code`.
+
+### 911 — Second  [status: deferred]
+
+- **Description:** D.
+- **Outcome:** O.
+- **Scope (in):** S.
+- **Depends on:** 910
+"""
+
+
+class SyncParserCharacterizationTest(unittest.TestCase):
+    def test_fixture_entries_are_exactly_these(self):
+        entries = roadmap_issues.parse_roadmap(CHARACTERIZATION_ROADMAP)
+        self.assertEqual(["910", "911"], list(entries))
+        first = entries["910"]
+        self.assertEqual(("First", "planned", "specs/910-custom"),
+                         (first["title"], first["status"], first["spec_dir"]))
+        self.assertEqual(
+            {
+                "Description": "One two three.",
+                "Outcome": "O.",
+                "Scope (in)": "S.",
+                "Scope (out)": "Nothing.",
+                "Depends on": "none",
+                "Governed by": "the constitution",
+                "Spec dir": "`specs/910-custom/`",
+                "Notes": "Start. End `code`.",
+            },
+            {k: " ".join(v.split()) for k, v in first["fields"].items()},
+        )
+        second = entries["911"]
+        self.assertEqual("deferred", second["status"])
+        self.assertIsNone(second["spec_dir"])
+        self.assertEqual("910", second["fields"]["Depends on"])
+
+    @unittest.skipUnless(
+        (Path(__file__).resolve().parent.parent / "ROADMAP.md").is_file(),
+        "no ROADMAP.md yet (an uninitialized repository, such as the template)",
+    )
+    def test_real_roadmap_matches_the_validator(self):
+        text = (Path(__file__).resolve().parent.parent / "ROADMAP.md").read_text(encoding="utf-8")
+        validated = {}
+        check_roadmap_dependencies.parse_roadmap(text, validated, statuses=roadmap_issues.PLAN_STATUSES)
+        synced = roadmap_issues.parse_roadmap(text)
+        self.assertEqual(list(validated), list(synced))
+        for number, entry in synced.items():
+            self.assertEqual(validated[number]["title"], entry["title"])
+            self.assertEqual(validated[number]["status"], entry["status"])
+            self.assertEqual(validated[number]["depends"] or ["none"],
+                             [d.strip() for d in entry["fields"]["Depends on"].split(",")])
+            self.assertEqual(" ".join(validated[number]["notes"].split()),
+                             " ".join(entry["fields"].get("Notes", "").split()))
+
+    def test_duplicate_roadmap_id_is_rejected(self):
+        text = "# R\n\n## Planned Specs\n\n" + "### 910 — T  [status: planned]\n\n- **Depends on:** none\n" * 2
+        with self.assertRaises(SystemExit) as raised:
+            roadmap_issues.parse_roadmap(text)
+        self.assertIn("910", str(raised.exception))
+
+
+class SyncReadsExactlyWhatTheValidatorAcceptsTest(unittest.TestCase):
+    SHAPES = {
+        "intro paragraph and thematic break": (
+            "# Roadmap\n\nIntro text.\n---\n\n## Planned Specs\n\n" + ENTRY_910
+        ),
+        "Setext title": "Roadmap\n=======\n\n## Planned Specs\n\n" + ENTRY_910,
+        "thematic break under a later section": (
+            "# Roadmap\n\n## Planned Specs\n\n" + ENTRY_910 + "\n## Notes\n\nText.\n---\n"
+        ),
+        "hashtag line without a space": (
+            "# Roadmap\n\n#tag line\n\n## Planned Specs\n\n" + ENTRY_910 + "\n## Notes\n\n#another tag\n"
+        ),
+    }
+
+    def test_validator_and_sync_agree_on_the_entries(self):
+        for name, text in self.SHAPES.items():
+            with self.subTest(name):
+                check_roadmap.validate_roadmap_text(text)
+                synced = roadmap_issues.parse_roadmap(text)
+                self.assertEqual(["910"], list(synced))
+                self.assertEqual("N.", synced["910"]["fields"]["Notes"])
+
+    def test_entry_outside_planned_specs_exits(self):
+        text = SECTION + ENTRY_910 + "\n## Archive\n\n" + ENTRY_910.replace("910", "911")
+        with self.assertRaises(SystemExit) as raised:
+            roadmap_issues.parse_roadmap(text)
+        self.assertIn("outside Planned Specs", str(raised.exception))
+
+    def test_stricter_field_regex_needs_a_space_after_the_colon(self):
+        text = SECTION + ENTRY_910.replace("- **Notes:** N.", "- **Notes:**text")
+        fields = roadmap_issues.parse_roadmap(text)["910"]["fields"]
+        self.assertNotIn("Notes", fields)
+        self.assertEqual("none - **Notes:**text", fields["Depends on"])
 
 
 class UninitializedRepositoryTest(unittest.TestCase):

@@ -72,6 +72,8 @@ jobs:
 
       - name: Synchronize roadmap issues
         env:
+          # Unbuffered, so a failure prints in order with the script output in the log.
+          PYTHONUNBUFFERED: '1'
           GH_TOKEN: ${{ github.token }}
           # App token first; PROJECT_BOARD_TOKEN only once the project context is read.
           BOARD_GH_TOKEN: ${{ steps.board-token.outputs.token || (steps.project-config.outputs.owner != '' && secrets.PROJECT_BOARD_TOKEN) || '' }}

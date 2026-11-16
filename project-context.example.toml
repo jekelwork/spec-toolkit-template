@@ -6,9 +6,10 @@ description = "Describe your project."
 owner = "example-org"
 number = 123
 
-# Optional. Independent approvals a pull request needs. 0 means a solo project
-# with no independent approval; the default is 1 when this section is absent.
-# `python3 scripts/bootstrap.py github` applies it to the branch ruleset. State
-# the same number in the constitution's approval rule.
-# [review]
-# required_approvals = 1
+# Required; there is no implicit default. Independent approvals a pull request
+# needs. Use the number your constitution's Git workflow principle sets; 0 is a
+# solo project with no independent approval. A team project must set at least 1;
+# 0 lets any member merge their own pull request without review. `python3 scripts/bootstrap.py
+# github` applies it to the branch ruleset, so keep it equal to the constitution.
+[review]
+required_approvals = 0

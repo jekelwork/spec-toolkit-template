@@ -168,7 +168,7 @@ class InitDefaultsTest(BootstrapTestCase):
             {
                 "project": {"name": "widgets", "description": "A tool"},
                 "github_project": {"owner": "acme", "number": 3},
-                "review": {"required_approvals": 1},
+                "review": {"required_approvals": 0},
             },
         )
         project_context.load_context(self.target)
@@ -183,6 +183,24 @@ class InitDefaultsTest(BootstrapTestCase):
         self.assertEqual(data["project"]["name"], "Custom")
         self.assertEqual(data["github_project"], {"owner": "other-org", "number": 9})
         self.assertEqual(data["review"], {"required_approvals": 0})
+
+    def test_a_defaulted_zero_prints_a_notice_but_an_explicit_value_does_not(self):
+        notice = ("Notice: required_approvals = 0 (solo project). "
+                  "A team project must pass --required-approvals 1 or more.")
+        self.init("--description", "D", "--project-number", "1")
+        self.assertIn(notice, self.out)
+        for value in ("0", "1"):
+            self.init("--description", "D", "--project-number", "1",
+                      "--required-approvals", value, "--force")
+            self.assertNotIn("Notice: required_approvals", self.out)
+        self.init("--force", tty=True, answers=["", "Desc", "", "4", ""])
+        self.assertIn(notice, self.out)
+
+    def test_flag_value_is_written_explicitly(self):
+        code = self.init("--description", "D", "--project-number", "1", "--required-approvals", "2")
+        self.assertEqual(code, 0, self.err)
+        self.assertEqual(self.written()["review"], {"required_approvals": 2})
+        self.assertIn("required_approvals = 2", self.target.read_text())
 
     def test_without_a_remote_the_name_is_the_directory_and_owner_is_required(self):
         run = FakeRun(remote=None)
@@ -224,12 +242,20 @@ class InitPromptTest(BootstrapTestCase):
             {
                 "project": {"name": "widgets", "description": "My description"},
                 "github_project": {"owner": "acme", "number": 4},
-                "review": {"required_approvals": 1},
+                "review": {"required_approvals": 0},
             },
         )
         joined = "\n".join(self.prompts)
         self.assertIn("widgets", joined)
         self.assertIn("acme", joined)
+
+    def test_a_typed_zero_is_explicit_and_prints_no_notice(self):
+        self.init(tty=True, answers=["", "Desc", "", "4", "0"])
+        self.assertNotIn("Notice: required_approvals", self.out)
+
+    def test_tty_prompt_proposes_zero(self):
+        self.init(tty=True, answers=["", "Desc", "", "4", ""])
+        self.assertIn("Required approvals (0 for a solo project) [0]: ", self.prompts)
 
     def test_tty_answers_replace_defaults(self):
         code = self.init(tty=True, answers=["Typed", "Desc", "typed-org", "2", "0"])

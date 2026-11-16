@@ -10,10 +10,10 @@ from pathlib import Path
 import re
 import sys
 
+import check_roadmap_dependencies
+
 ROADMAP_ID = re.compile(r"^\d{3}$")
-HEADING = re.compile(r"^### (\d{3})\s+[—–-]\s+(.+?)\s+\[status:\s*([A-Za-z-]+)\]\s*$")
-FIELD = re.compile(r"^- \*\*(.+?):\*\*\s*(.*)$")
-EPIC_FIELDS = ("Description", "Outcome", "Scope (in)", "Scope (out)", "Depends on", "Governed by")
+EPIC_FIELDS = ("Description", "Outcome", "Scope (in)", "Scope (out)", "Depends on", "Governed by", "Notes")
 ARTIFACTS = (("Specification", "spec.md"), ("Plan", "plan.md"), ("Tasks", "tasks.md"))
 
 # Planning issues, in creation order. There is only one: the tasks are generated on the
@@ -81,8 +81,9 @@ def spec_plan_body(entry, feature_path):
         "- [ ] Keep the roadmap plan-only; GitHub records specification and implementation progress\n"
         "- [ ] `code-review-and-quality` review of the final diff (through `code-reviewer`)\n"
         "- [ ] The pull request has the independent approvals the constitution requires, mirrored in "
-        "`[review] required_approvals` in `project-context.toml` (default 1; 0 only where the "
-        "constitution allows a solo project; the constitution wins), and it is merged\n\n"
+        "`[review] required_approvals` in `project-context.toml` (required, no implicit "
+        "default; the constitution wins; 0 is valid only where the constitution allows a solo "
+        "project), and it is merged\n\n"
         "Do not run `speckit-tasks` on this branch: the initial `tasks.md` is generated on the "
         "Phase 1 implementation branch after this pull request is merged.\n"
     )
@@ -128,28 +129,14 @@ def roadmap_id_for_path(feature_path):
 
 
 def parse_roadmap(text):
-    """Return {roadmap ID: entry} for every '### NNN — Title  [status: x]' entry."""
-    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
-    entries = {}
-    entry = None
-    for line in text.splitlines():
-        heading = HEADING.match(line)
-        if heading:
-            roadmap_id, title, status = heading.groups()
-            if roadmap_id in entries:
-                sys.exit(
-                    f"Duplicate roadmap ID {roadmap_id} in ROADMAP.md; "
-                    "give each entry a unique canonical ID before re-running."
-                )
-            entry = {"id": roadmap_id, "title": title.strip(), "status": status.lower(), "fields": {}}
-            entries[roadmap_id] = entry
-            continue
-        if re.match(r"^#{1,3} ", line):
-            entry = None
-            continue
-        field = FIELD.match(line) if entry else None
-        if field:
-            entry["fields"][field.group(1)] = field.group(2).strip()
+    """Return {roadmap ID: entry} from the validator's `## Planned Specs` section and field rules.
+
+    Exits with the validator's message when the roadmap is not valid enough to read safely.
+    """
+    try:
+        entries = check_roadmap_dependencies.parse_entry_fields(text)
+    except check_roadmap_dependencies.InvalidData as error:
+        sys.exit(f"Cannot parse ROADMAP.md: {error}")
     for entry in entries.values():
         spec_dir = entry["fields"].get("Spec dir", "").strip("` ").rstrip("/")
         entry["spec_dir"] = spec_dir or None

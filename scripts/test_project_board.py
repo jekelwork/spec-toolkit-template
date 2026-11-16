@@ -90,6 +90,100 @@ class AddIssueToProjectTest(ProjectBoardTest):
         self.assertEqual(("PVTI_4", None), self.item(fake, 4))
         self.assertEqual([], gh_project_calls(fake))
 
+    def test_a_fresh_add_needs_no_lookup_and_no_sleep(self):
+        fake = self.use(FakeGitHub())
+        fake.add_issue(4, "body")
+        sleeps = []
+
+        with (
+            patch.object(project_board, "_sleep", sleeps.append),
+            patch.object(project_board, "project_item") as lookup,
+        ):
+            item_id = project_board.add_issue_to_project(
+                OWNER, REPO, 4, project_board.Project("example-org", 123)
+            )
+
+        self.assertEqual("PVTI_4", item_id)
+        lookup.assert_not_called()
+        self.assertEqual([], sleeps)
+
+    def test_returns_the_existing_item_when_github_already_added_the_content(self):
+        fake = self.use(FakeGitHub())
+        fake.add_issue(4, "body", status="Backlog")
+
+        item_id = project_board.add_issue_to_project(
+            OWNER, REPO, 4, project_board.Project("example-org", 123)
+        )
+
+        self.assertEqual("PVTI_4", item_id)
+
+    def test_other_add_errors_still_fail_with_their_message(self):
+        fake = self.use(FakeGitHub())
+        fake.add_issue(4, "body")
+        original = fake._dispatch
+
+        def dispatch(args):
+            if any("addProjectV2ItemById" in a for a in args):
+                return fake._result(
+                    1, stderr="gh: Resource not accessible", args=args, check=fake._check
+                )
+            return original(args)
+
+        with patch.object(fake, "_dispatch", dispatch):
+            with self.assertRaises(SystemExit) as stopped:
+                project_board.add_issue_to_project(
+                    OWNER, REPO, 4, project_board.Project("example-org", 123)
+                )
+
+        self.assertEqual(
+            "Cannot add issue #4 to project example-org/123: gh: Resource not accessible",
+            str(stopped.exception),
+        )
+
+    def lagging_lookup(self, fake, misses):
+        """Make the item lookup answer 'not in the project' for the first `misses` reads."""
+        real = project_board.project_item
+        reads = []
+
+        def lookup(*args):
+            reads.append(args)
+            return None if len(reads) <= misses else real(*args)
+
+        return patch.object(project_board, "project_item", lookup), reads
+
+    def test_retries_the_lookup_when_the_auto_added_item_is_not_visible_yet(self):
+        fake = self.use(FakeGitHub())
+        fake.add_issue(4, "body", status="Backlog")
+        lag, reads = self.lagging_lookup(fake, misses=2)
+        sleeps = []
+
+        with lag, patch.object(project_board, "_sleep", sleeps.append):
+            item_id = project_board.add_issue_to_project(
+                OWNER, REPO, 4, project_board.Project("example-org", 123)
+            )
+
+        self.assertEqual("PVTI_4", item_id)
+        self.assertEqual(3, len(reads))
+        self.assertEqual(2, len(sleeps))
+
+    def test_item_never_visible_stops_with_a_rerun_message(self):
+        fake = self.use(FakeGitHub())
+        fake.add_issue(4, "body", status="Backlog")
+        lag, reads = self.lagging_lookup(fake, misses=99)
+
+        with lag, patch.object(project_board, "_sleep", lambda seconds: None):
+            with self.assertRaises(SystemExit) as stopped:
+                project_board.add_issue_to_project(
+                    OWNER, REPO, 4, project_board.Project("example-org", 123)
+                )
+
+        self.assertEqual(
+            "GitHub reports issue #4 is already in project example-org/123, but it is not "
+            "visible yet; rerun the sync",
+            str(stopped.exception),
+        )
+        self.assertEqual(3, len(reads))
+
     def test_works_for_a_user_owned_board_without_gh_project_owner_lookup(self):
         fake = self.use(FakeGitHub(project_owner="some-user", project_owner_kind="user"))
         fake.add_issue(4, "body")
@@ -115,6 +209,51 @@ class AddIssueToProjectTest(ProjectBoardTest):
         )
 
         self.assertEqual(("PVTI_4", "Planned"), self.item(fake, 4))
+
+
+class FakeAutoAddTest(ProjectBoardTest):
+    # These tests check the fake's own timing model (its internal queue), not production code.
+    def test_auto_add_keeps_an_item_that_is_already_on_the_board(self):
+        fake = self.use(FakeGitHub())
+        fake.auto_add_sub_issues = True
+        fake.add_issue(1, "epic", status="Planned")
+        fake.add_issue(4, "child", status="In progress")
+        fake.project_items[4]["order"] = 7.0
+
+        fake(
+            "api", "-X", "POST", f"repos/{OWNER}/{REPO}/issues/1/sub_issues",
+            "-F", f"sub_issue_id={fake.issues[4]['id']}",
+        )
+
+        self.assertIn(4, fake.pending_auto_adds)
+
+        self.assertEqual(("PVTI_4", "In progress"), self.item(fake, 4))
+        self.assertEqual(set(), fake.pending_auto_adds)
+        self.assertEqual(7.0, fake.project_items[4]["order"])
+
+    def test_auto_add_queues_existing_children_when_the_parent_is_added(self):
+        fake = self.use(FakeGitHub())
+        fake.auto_add_sub_issues = True
+        fake.add_issue(1, "epic")
+        fake.add_issue(4, "child")
+        fake(
+            "api", "-X", "POST", f"repos/{OWNER}/{REPO}/issues/1/sub_issues",
+            "-F", f"sub_issue_id={fake.issues[4]['id']}",
+        )
+
+        fake(
+            "api", "graphql",
+            "-f", "query=mutation { addProjectV2ItemById }",
+            "-f", "projectId=PVT_project",
+            "-f", f"contentId={fake.issues[1]['node_id']}",
+        )
+
+        self.assertIn(4, fake.pending_auto_adds)
+
+        self.assertIsNone(self.item(fake, 4))  # the first read still sees nothing
+        self.assertEqual(set(), fake.pending_auto_adds)
+        self.assertIn(4, fake.project_items)
+        self.assertIsNotNone(self.item(fake, 4))
 
 
 class EnsureRemovedTest(ProjectBoardTest):

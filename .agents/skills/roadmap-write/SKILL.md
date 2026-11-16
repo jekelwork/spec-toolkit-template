@@ -41,8 +41,9 @@ the root plan-only roadmap and its owned format validator.
 - Keep each entry's description, outcome, scope, dependencies, and notes
   consistent with the confirmed project context. Every dependency must name an
   existing entry and the graph must remain acyclic.
-- Keep `Spec dir` prefixes equal to the entry ID. Do not change or renumber
-  existing IDs to work around an inconsistency.
+- Keep `Spec dir` prefixes equal to the entry ID, and add a `Spec dir` only after its
+  `spec.md` exists. Do not change or renumber existing IDs to work around an
+  inconsistency.
 - Preserve historical content. Do not turn old progress notes into current
   status, and never write `specced`, `in-progress`, `implemented`, or `verified`
   as plan statuses.

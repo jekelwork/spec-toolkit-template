@@ -89,12 +89,15 @@ The project-status workflow validates this file before creating its App token.
 `sync-project-status.py` uses `github_project.owner` and `github_project.number`
 for any board options not explicitly supplied on the command line.
 
-The optional `[review]` section sets `required_approvals`, the independent approvals a
-pull request needs: a non-negative integer, `0` for a solo project, `1` when the section is
-absent. `python3 scripts/project_context.py --required-approvals` prints the effective value.
+The `[review]` section sets `required_approvals`, the independent approvals a
+pull request needs: a non-negative integer, `0` for a solo project. It is required and has no
+implicit default: a missing section or key fails validation and nothing falls back to 0 or 1.
+`bootstrap.py init` proposes 0 for a new project; the constitution decides the number. See
+"Upgrading an existing repository" in `docs/bootstrap.md` for adding it to an existing context.
+`python3 scripts/project_context.py --required-approvals` prints the value.
 `bootstrap.py github` applies the value to the branch ruleset, and the constitution's approval rule
 should state the same number (give it to the `speckit-constitution` skill). The JSON output
-contains `review` only when the section is present.
+always contains `review`.
 
 ### Not-yet-initialized state
 
@@ -177,9 +180,9 @@ Never edit these generated scripts by hand; change them only through
 
 Validates the root, plan-only `ROADMAP.md`: entry heading and field shape,
 unique three-digit IDs, the five plan statuses, required fields, dependency
-references and cycles, and `Spec dir` prefixes. It also calls
-`check_roadmap_spec_ids.py` to verify spec directory IDs and the spec `Input`
-references.
+references and cycles, and `Spec dir` paths. It also calls
+`check_roadmap_spec_ids.py` to verify spec directory IDs, that each `Spec dir`
+already contains `spec.md`, and the spec `Input` references.
 
 ```bash
 python3 scripts/check_roadmap.py
@@ -371,11 +374,12 @@ python3 scripts/sync-roadmap-issues.py --apply --skip-project
 ```
 
 - `--id NNN` limits issue changes to one canonical roadmap ID; otherwise entries are processed in file order. Roadmap and planning issues are found by their markers, not their titles.
+- The Epic body lists the entry's Description, Outcome, Scope (in), Scope (out), Depends on, Governed by and Notes, in that order, when present. Following lines (indented or not) continue the field and are joined with single spaces, as in the roadmap validator; blank lines are skipped and only a new field or a heading ends the field. Fenced code blocks, including their content, are dropped from the Epic body, and nested bullets and line breaks inside a field are flattened into one line, so keep roadmap fields to plain prose.
 - `planned` creates or updates an Epic, the `SPEC: <ID> Create and approve spec and plan` planning issue and one provisional `Phase 1: Kickoff — <Epic name>` Story (stable `phase-1` marker). Both are sub-issues of the Epic, and Phase 1 is blocked by the spec-and-plan issue. When the spec-and-plan issue closes as completed, only that blocker is cleared (never re-added; other blockers are preserved). There is no tasks planning issue. Once `specs/<feature>/tasks.md` exists, roadmap sync stops updating Phase 1 and leaves it to the task sync.
 - `needs-info` keeps the Epic and labels it `needs-info`; any existing planning and Phase issues are closed as not planned. Returning to `planned` creates missing planning issues and reopens the same paused Phase issues. `deferred` closes open Epic, planning and Phase issues as not planned; returning to `planned` reopens those same Phase issues. `abandoned` and removed entries are closed as not planned and labeled `abandoned`; their Phase issues are retired and never reopened automatically. Closing an entry is blocked while any Phase is In progress, In review or Done, so resolve that work explicitly first. `undecided` creates no issues. The roadmap sync does not reopen a completed Epic; the task sync reopens it if checkbox changes make Phase work incomplete again.
 - Dependencies are synchronized as GitHub "blocked by" links between marked roadmap Epics. Only stale links between those epics are removed; unrelated links are preserved.
 - Only trusted issues are matched by marker, for lookups, removals and dependencies alike: the author is a bot (any login ending in `[bot]`, so every App installed on the repository), or the `author_association` is `OWNER`, `MEMBER` or `COLLABORATOR`, or the issue carries an `Epic`, `Story` or `Planning` label (setting a label needs triage rights, so legitimate issues of a departed author or a private member reported as `CONTRIBUTOR` still match and no duplicate Epic is created). Other marker copies are ignored with a warning and are never closed, labelled or commented on.
-- `--skip-project` skips Project updates. Otherwise the script uses `github_project.owner` and `github_project.number` from [`project-context.toml`](../project-context.toml), adds roadmapped Epics, planning issues and the provisional Phase 1, sets the Epic's one-based `Roadmap order` field, and sets Phase 1 to `Planned` when its status is unset or `Backlog`. `--project-owner` and `--project-number` override the corresponding settings. A missing field is reported without failing the sync.
+- `--skip-project` skips Project updates. Otherwise the script uses `github_project.owner` and `github_project.number` from [`project-context.toml`](../project-context.toml), adds roadmapped Epics, planning issues and the provisional Phase 1, sets the Epic's one-based `Roadmap order` field, and sets Phase 1 to `Planned` when its status is unset or `Backlog`. `--project-owner` and `--project-number` override the corresponding settings. A missing field is reported without failing the sync. Adding an issue to the board is idempotent: when GitHub answers that the content already exists in the project (its built-in "Auto-add sub-issues to project" workflow adds sub-issues once their Epic is on the board), the existing item is used. The sync looks it up again a few times; if it is still not visible it stops with `... is already in project ..., but it is not visible yet; rerun the sync`, so rerun it. Any other refusal fails with GitHub's message.
 - GitHub rate-limit 403/429 responses are retried with a 60-second pause; other 403 errors fail immediately. Issue creations are spaced briefly to avoid secondary limits.
 
 The workflow uses `GITHUB_TOKEN` for repository issue operations. Board updates use a board credential: the `PROJECT_STATUS_APP_ID` and `PROJECT_BOARD_APP_PRIVATE_KEY` secrets (a scoped App token that reads repository issues and writes to organization Projects) or `PROJECT_BOARD_TOKEN` (see [Board credentials](../docs/bootstrap.md#board-credentials)). If neither is configured, CI passes `--skip-project`. Pushes and scheduled runs are read-only previews; applies are manual. Before approving the first `--apply`, compare every proposed create, update, close, reopen and relationship change with `ROADMAP.md` and the existing GitHub issues. Confirm that only the intended managed Epics, planning issues and provisional Phase 1 issues are changed. Then approve a manual apply run, verify the resulting issue hierarchy and rerun the dry run. Before the first apply, create the labels with `python3 scripts/bootstrap.py github --apply` after obtaining settings approval.
@@ -573,4 +577,4 @@ SPECKIT_VERSION=<new> scripts/specify.sh integration upgrade codex
 
 ## check_roadmap_spec_ids.py
 
-Checks that each roadmap Spec dir and each spec Input entry match the spec directory prefix. Run `python3 scripts/check_roadmap_spec_ids.py`; Repository tools CI invokes it indirectly through `python3 scripts/check_roadmap.py` on pull requests. Tests: `python3 -m unittest scripts/test_check_roadmap_spec_ids.py`.
+Checks that each roadmap Spec dir and each spec Input entry match the spec directory prefix, and that each Spec dir already contains `spec.md`. Run `python3 scripts/check_roadmap_spec_ids.py`; Repository tools CI invokes it indirectly through `python3 scripts/check_roadmap.py` on pull requests. Tests: `python3 -m unittest scripts/test_check_roadmap_spec_ids.py`.

@@ -228,13 +228,14 @@ class CredentialStepTest(CheckTestCase):
         self.assertIn("docs/bootstrap.md#board-credentials", hint)
         self.assertIn("✓", self.line("oard credential"))
 
-    def test_missing_review_section_defaults_to_required_and_shows_the_hint(self):
+    def test_missing_review_section_is_an_error(self):
         self.write()
         path = self.root / "project-context.toml"
         text = path.read_text()
         path.write_text(re.sub(r"\[review\]\n(?:[^\[\n].*\n|\n)*", "", text))
-        self.assertEqual(self.check(self.configured_github()), 0)
-        self.assertIn(self.HINT, self.line("Hint:"))
+        self.assertNotEqual(self.check(), 0)
+        self.assertIn("project-context.toml is invalid", self.out)
+        self.assertIn("add `[review] required_approvals = N`", self.out)
 
     def test_pat_without_required_reviews_shows_no_hint(self):
         self.write(approvals=0)

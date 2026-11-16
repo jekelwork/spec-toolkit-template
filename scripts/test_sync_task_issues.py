@@ -1134,7 +1134,7 @@ class PhaseSyncTest(unittest.TestCase):
         self.assertEqual([], fake.mutations())
 
     def test_roadmap_epic_requires_roadmap_entry(self):
-        (self.root / "ROADMAP.md").write_text("# Roadmap\n", encoding="utf-8")
+        (self.root / "ROADMAP.md").write_text("# Roadmap\n\n## Planned Specs\n", encoding="utf-8")
         result, _ = self.run_sync(self.initialized(), "--apply")
         self.assertIn("900", result)
         self.assertIn("ROADMAP.md", result)

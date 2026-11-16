@@ -84,7 +84,7 @@ python3 scripts/bootstrap.py init --description "What the project does" --create
 `init` takes the owner and project name from the `origin` remote and prompts for the rest in a
 terminal; without one, or with `--yes`, it names the flag for any missing value. The board is
 `--project-number N` for an existing one or `--create-board` for a new empty one. Other flags:
-`--name`, `--owner`, `--required-approvals`, `--force` (overwrite). The result is validated before it
+`--name`, `--owner`, `--required-approvals` (default 0), `--force` (overwrite). The result is validated before it
 is written:
 
 ```toml
@@ -97,16 +97,25 @@ owner = "acme"
 number = 3
 
 [review]
-required_approvals = 1
+required_approvals = 0
 ```
 
-`required_approvals` is the number of independent approvals a pull request needs. **A solo project
-should choose 0** (`--required-approvals 0`), because the author cannot approve their own pull
-request. The same number goes into the constitution and the ruleset (see below). The ruleset enforces
-it; GitHub keeps each review (reviewer, state, reviewed commit and time) on the pull request, so
-there is no separate approval record. With 0, branch protection requires no approvals. To see who
-approved a change, find its pull request (the merge commit names it) and run
+`required_approvals` is the number of independent approvals a pull request needs. It is required and
+has no implicit default: a missing `[review]` section or key makes validation fail. `init` always
+writes it and proposes 0 for a new project (`--required-approvals N` sets another number); the
+constitution decides the number. **A solo project should choose 0**, because the author cannot
+approve their own pull request. A team project must set at least 1; 0 lets any member merge their
+own pull request without review. The same number goes into the constitution and the ruleset (see
+below). The ruleset enforces it; GitHub keeps each review (reviewer, state, reviewed commit and
+time) on the pull request, so there is no separate approval record. With 0, branch protection
+requires no approvals. To see who approved a change, find its pull request (the merge commit names
+it) and run
 `gh pr view <n> --json reviews --jq '.reviews[] | "\(.author.login) \(.state) \(.commit.oid[0:7]) \(.submittedAt)"'`.
+
+**Upgrading an existing repository.** Add `[review] required_approvals = N` to
+`project-context.toml`, with the number the constitution states. The old implicit value was 1, so
+`required_approvals = 1` keeps the current ruleset. Lowering an existing ruleset to 0 needs
+`bootstrap.py github --apply --allow-weaken`.
 
 ## Constitution
 

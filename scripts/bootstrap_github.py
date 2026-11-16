@@ -457,6 +457,11 @@ def plan_ruleset(repo, approvals, run, allow_weaken=False):
 
     if current is None:
         plan.add("Ruleset", text)
+        if approvals == 0:
+            plan.notes.append(
+                "the new ruleset requires no independent approval for the main branch "
+                "(required_approvals = 0)"
+            )
     plan.actions.append(("Ruleset", write))
     return plan
 

@@ -53,5 +53,19 @@ jobs:
             echo "::error::Unexpected output from project_context.py --bootstrap-state: '$state' (expected initialized or uninitialized)."
             exit 1
           fi
+      - name: Validate the project context once the repository is initialized
+        run: |
+          # A missing or invalid project-context.toml (for example no [review] required_approvals)
+          # fails here without needing a board credential. The template has none and skips this.
+          set -euo pipefail
+          state=$(python3 scripts/project_context.py --bootstrap-state)
+          if [ "$state" = "initialized" ]; then
+            python3 scripts/project_context.py > /dev/null
+          elif [ "$state" = "uninitialized" ]; then
+            echo "::notice::Project context check skipped: this repository is not initialized yet. See docs/bootstrap.md."
+          else
+            echo "::error::Unexpected output from project_context.py --bootstrap-state: '$state' (expected initialized or uninitialized)."
+            exit 1
+          fi
       - name: Check agent skills, sub-agents and Spec Kit version
         run: python3 scripts/agent_setup.py check

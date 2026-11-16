@@ -28,8 +28,18 @@ Only these plan statuses are valid: `undecided`, `needs-info`, `planned`,
 
 Optional fields are `Scope (out)`, `Governed by`, `Spec dir`, and `Notes`.
 Dependencies are `none` or a comma-separated list of existing three-digit IDs;
-the graph must be acyclic. A `Spec dir`, when present, starts with
-`specs/<entry-ID>-`. Put extra context in `Notes`; fields not listed above are rejected.
+the graph must be acyclic. A `Spec dir`, when present, is exactly
+`specs/<entry-ID>-<slug>` (one directory, an optional trailing `/`, optionally in
+backticks) and must name a directory that already contains `spec.md`, so add it only
+after the spec exists.
+Put extra context in `Notes`; fields not listed above are rejected.
+
+A field may continue on the lines after it, indented or not. The roadmap sync appends those lines to
+the field, joined with single spaces. Blank lines are skipped, and only a new `- **Field:**` line or a
+heading ends the field. The Epic body shows Description, Outcome, Scope (in), Scope (out), Depends on,
+Governed by and Notes (every field except Spec dir).
+Fenced code blocks, including their content, are dropped from the Epic body. Nested bullets and line
+breaks inside a field are flattened into one line there, so keep roadmap fields to plain prose.
 
 The read-only validator checks both the ledger format and the IDs referenced by
 spec directories:

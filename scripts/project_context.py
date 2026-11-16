@@ -26,11 +26,13 @@ NO_CREDENTIAL_NOTICE = (
 SCHEMA = {
     "project": {"name", "description"},
     "github_project": {"owner", "number"},
-}
-OPTIONAL_SCHEMA = {
     "review": {"required_approvals"},
 }
-DEFAULT_REQUIRED_APPROVALS = 1
+MISSING_REVIEW_MESSAGE = (
+    "missing review.required_approvals: add `[review] required_approvals = N`, using the "
+    "number of independent approvals your constitution's Git workflow principle sets "
+    "(0 for a solo project)"
+)
 OWNER_PATTERN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 
 
@@ -105,8 +107,10 @@ def board_owner_or_skip(config, root, repository_owner, environ):
 def load_context(path):
     with path.open("rb") as file:
         context = tomllib.load(file)
-    unknown_sections = set(context) - set(SCHEMA) - set(OPTIONAL_SCHEMA)
+    unknown_sections = set(context) - set(SCHEMA)
     missing_sections = set(SCHEMA) - set(context)
+    if missing_sections == {"review"} and not unknown_sections:
+        raise ValueError(MISSING_REVIEW_MESSAGE)
     if unknown_sections or missing_sections:
         problems = []
         if unknown_sections:
@@ -114,8 +118,7 @@ def load_context(path):
         if missing_sections:
             problems.append(f"missing sections: {', '.join(sorted(missing_sections))}")
         raise ValueError(
-            f"{'; '.join(problems)} (required sections: {', '.join(SCHEMA)}; "
-            f"optional sections: {', '.join(OPTIONAL_SCHEMA)})"
+            f"{'; '.join(problems)} (required sections: {', '.join(SCHEMA)})"
         )
     for section, keys in SCHEMA.items():
         values = context[section]
@@ -123,10 +126,11 @@ def load_context(path):
             raise ValueError(f"{section} must be a table")
         missing = keys - values.keys()
         unknown = values.keys() - keys
-        if missing:
-            raise ValueError(f"missing {section}.{', '.join(sorted(missing))}")
         if unknown:
             raise ValueError(f"unknown {section} keys: {', '.join(sorted(unknown))}")
+        if missing:
+            hint = f": {MISSING_REVIEW_MESSAGE.partition(': ')[2]}" if section == "review" else ""
+            raise ValueError(f"missing {section}.{', '.join(sorted(missing))}{hint}")
     for key in ("name", "description"):
         value = context["project"][key]
         if not isinstance(value, str) or not value.strip():
@@ -137,22 +141,15 @@ def load_context(path):
     number = context["github_project"]["number"]
     if type(number) is not int or number < 1:
         raise ValueError("github_project.number must be a positive integer")
-    if "review" in context:
-        review = context["review"]
-        if not isinstance(review, dict):
-            raise ValueError("review must be a table")
-        unknown = review.keys() - OPTIONAL_SCHEMA["review"]
-        if unknown:
-            raise ValueError(f"unknown review keys: {', '.join(sorted(unknown))}")
-        approvals = review.get("required_approvals")
-        if "required_approvals" in review and (type(approvals) is not int or approvals < 0):
-            raise ValueError("review.required_approvals must be a non-negative integer")
+    approvals = context["review"]["required_approvals"]
+    if type(approvals) is not int or approvals < 0:
+        raise ValueError("review.required_approvals must be a non-negative integer")
     return context
 
 
 def required_approvals(context):
-    """Independent approvals a pull request needs; 0 is a solo project, absent means 1."""
-    return context.get("review", {}).get("required_approvals", DEFAULT_REQUIRED_APPROVALS)
+    """Independent approvals a pull request needs; 0 is a solo project. Never implied."""
+    return context["review"]["required_approvals"]
 
 
 def validate_repository_owner(context, repository_owner):
@@ -184,7 +181,7 @@ def main():
     modes.add_argument(
         "--required-approvals",
         action="store_true",
-        help="print review.required_approvals (1 when the setting is absent)",
+        help="print review.required_approvals (required in the context)",
     )
     modes.add_argument(
         "--board-owner-or-skip",

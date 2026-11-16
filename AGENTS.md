@@ -4,6 +4,27 @@
 
 Read the project name and description from [`project-context.toml`](project-context.toml); run `python3 scripts/project_context.py` to validate it. Feature specs, plans, and tasks are organized in the `specs/` directory. Governance rules are defined in [`.specify/memory/constitution.md`](.specify/memory/constitution.md) and are not overridden by project context.
 
+## Where to find what
+
+| Question | Where to look |
+| --- | --- |
+| Bootstrap a new project, check bootstrap progress or resume | [docs/bootstrap.md](docs/bootstrap.md), [Troubleshooting](docs/bootstrap.md#troubleshooting); `python3 scripts/bootstrap.py check`; [scripts/README.md](scripts/README.md#bootstrappy) |
+| Board credentials (optional): token or App secrets | [Board credentials](docs/bootstrap.md#board-credentials) |
+| Project settings and their validation | `project-context.toml`, [project-context.example.toml](project-context.example.toml); `python3 scripts/project_context.py` ([scripts/README.md](scripts/README.md#project_contextpy)) |
+| The constitution | `.specify/memory/constitution.md`, created at bootstrap by the speckit-constitution skill ([Constitution](docs/bootstrap.md#constitution)) |
+| Roadmap format and plan statuses | [docs/roadmap-format.md](docs/roadmap-format.md) |
+| How roadmap entries become issues, and what each sync does | [sync-roadmap-issues.py](scripts/README.md#sync-roadmap-issuespy), [sync-task-issues.py](scripts/README.md#sync-task-issuespy), [sync-project-status.py](scripts/README.md#sync-project-statuspy); [How the syncs behave](docs/bootstrap.md#how-the-syncs-behave); [GitHub workflows](README.md#github-workflows) |
+| Walk-through of a roadmap item, from entry to merged Phase | [Roadmap item walkthrough](scripts/README.md#roadmap-item-walkthrough) |
+| Progress and dependency completion | `python3 scripts/roadmap_status.py` ([scripts/README.md](scripts/README.md#roadmap_statuspy)) |
+| Approvals: where the count comes from, who approved | [Approvals](#approvals), the constitution, `[review] required_approvals` in `project-context.toml` |
+| Branch and pull request naming and linking | [Implementing Tasks](#implementing-tasks-from-tasksmd), [When Creating a Pull Request](#when-creating-a-pull-request); [README conventions](README.md#branch-and-pull-request-conventions); [pr_conventions.py](scripts/README.md#pr_conventionspy) |
+| Which agent takes which task | [Which agent takes which task](#which-agent-takes-which-task), [agent-definitions/](agent-definitions/) |
+| Where skills live, how agent files are generated | `.agents/skills/`, [Agents](#agents); `python3 scripts/agent_setup.py sync` ([scripts/README.md](scripts/README.md#agent_setuppy), [README](README.md#coding-agents)) |
+| Spec Kit steps and hooks | `.specify/extensions.yml`, the `speckit-*` skills in [.agents/skills/](.agents/skills/); [Hooks and enforcement](README.md#hooks-and-enforcement) |
+| Change or upgrade Spec Kit files | [Spec Kit CLI and version](README.md#spec-kit-cli-and-version), [specify.sh](scripts/README.md#specifysh) |
+| Resume after a context reset | [Keeping Track Across Sessions](#keeping-track-across-sessions) |
+| CI workflows, required checks and rulesets | [GitHub workflows](README.md#github-workflows), [Repository rulesets](README.md#repository-rulesets) |
+
 ## Non-Negotiable Guidance
 
 - **Prefer `gh` cli tool over Github MCP, if possible**
@@ -53,7 +74,7 @@ The team uses Copilot, Codex and Claude Code, and every skill and sub-agent exis
 | [`security-auditor`](agent-definitions/security-auditor.md)               | Report-only security pass: authentication and server-side authorization, infrastructure permissions, secrets, input handling, dependencies and supply chain; check the constitution's technology baseline.                                      |
 | [`web-performance-auditor`](agent-definitions/web-performance-auditor.md) | Report-only web performance audit of the project's web front end: Core Web Vitals, loading, rendering and network. Use when performance is the question, not on every change.                                                                   |
 
-The mandatory review gate is the `code-review-and-quality` skill, run through `code-reviewer`, on the exact final diff before a pull request is created (see "When Creating a Pull Request"), plus the independent non-author human approvals the constitution's Git workflow principle requires, mirrored in `[review] required_approvals` in `project-context.toml` (default 1; 0 is valid only where the constitution allows a solo project, and the constitution wins if they differ). `code-reviewer` also reviews each task's diff after `tdd-implementer` has run; `tdd-implementer` never reviews its own work and skips the `after_implement` `code-review-and-quality` hook, which remains as a safety net for anyone who runs `speckit-implement` directly; the other agents are invoked on demand. Run `security-auditor` for security-sensitive changes (the constitution's security principle) and before the first deployment. `code-reviewer`, `test-engineer`, `security-auditor` and `web-performance-auditor` are adapted from [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills) `agents/`; each file names the upstream commit it came from. `tdd-implementer` is local to this repository.
+The mandatory review gate is the `code-review-and-quality` skill, run through `code-reviewer`, on the exact final diff before a pull request is created (see "When Creating a Pull Request"), plus the independent non-author human approvals the constitution's Git workflow principle requires, mirrored in `[review] required_approvals` in `project-context.toml` (required, with no implicit default: a missing `[review]` section or key is a validation error; 0 is valid only where the constitution allows a solo project, and the constitution wins if they differ). `code-reviewer` also reviews each task's diff after `tdd-implementer` has run; `tdd-implementer` never reviews its own work and skips the `after_implement` `code-review-and-quality` hook, which remains as a safety net for anyone who runs `speckit-implement` directly; the other agents are invoked on demand. Run `security-auditor` for security-sensitive changes (the constitution's security principle) and before the first deployment. `code-reviewer`, `test-engineer`, `security-auditor` and `web-performance-auditor` are adapted from [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills) `agents/`; each file names the upstream commit it came from. `tdd-implementer` is local to this repository.
 
 ### Which agent takes which task
 
@@ -107,6 +128,12 @@ When a change renames or removes an identifier, changes configuration semantics,
 - **For Phase implementation, use the Phase issue as the work item.** Assign the user and move that issue to "In Progress" using the API (`gh` CLI). Do not create or assign GitHub issues for individual `T###` tasks.
 - **Starting a roadmap item:** follow the roadmap dependency and issue-backed planning rules above. Use its spec-plan planning issue for the spec-and-plan branch and the provisional `Phase 1: Kickoff — <Epic name>` story for the Phase 1 implementation branch, where `tasks.md` is generated (for example, `<issue>-spec-008-create-and-approve-spec-and-plan`); assign the user and move the issue to In Progress as above.
 
+### Keeping Track Across Sessions
+
+- **GitHub is the worklog.** The issue linked to the branch holds the goal, its pull request body holds decisions and their reasons, and open issues and unchecked tasks in `tasks.md` hold unfinished work. Do not keep a separate worklog file.
+- **The main session records pending user decisions as a comment on that issue,** for example review findings that wait for the user, so they survive a context reset (compaction or handoff). Never post unfixed security findings there: on a public repository a comment discloses them; tell the user, who decides where to keep them.
+- **After a context reset, read that issue, its pull request if one is open, and `git status` before continuing.** Reconcile new instructions with work already underway, and rerun the resume checks above: re-read `.specify/extensions.yml`, and recheck roadmap dependencies when resuming implementation.
+
 ### When Creating a Pull Request
 
 - **Before creating or opening any pull request, run the `code-review-and-quality` skill on the exact final diff, preferably through the `code-reviewer` agent.** Fix its Critical and Required findings (passing the work to `tdd-implementer` whenever possible; if you believe a finding is wrong, show it to the user with your reasoning instead of fixing it) and show its Optional, Nit and FYI findings to the user for a decision; if the diff changes after review, rerun the review on the updated diff. Do not create or open the pull request until the review is complete.
@@ -115,5 +142,5 @@ When a change renames or removes an identifier, changes configuration semantics,
 
 ### Approvals
 
-- **Approvals are enforced by the branch ruleset** with the count from `[review] required_approvals` in `project-context.toml` (default 1; 0 is valid only where the constitution allows a solo project). The constitution sets the count; `required_approvals` mirrors it, and the constitution wins if they differ. GitHub records each review (reviewer, state, reviewed commit, time) on the pull request; nothing is written into spec, plan or task documents.
+- **Approvals are enforced by the branch ruleset** with the count from `[review] required_approvals` in `project-context.toml` (required, with no implicit default; 0 is valid only where the constitution allows a solo project). The constitution sets the count; `required_approvals` mirrors it, and the constitution wins if they differ. GitHub records each review (reviewer, state, reviewed commit, time) on the pull request; nothing is written into spec, plan or task documents.
 - **To see who approved a change,** find its pull request (the merge commit names it) and run `gh pr view <n> --json reviews --jq '.reviews[] | "\(.author.login) \(.state) \(.commit.oid[0:7]) \(.submittedAt)"'`. Count only reviews whose state is `APPROVED` and whose author is not the PR author.
