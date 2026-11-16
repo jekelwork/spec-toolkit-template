@@ -32,6 +32,15 @@ class SpecPlanBodyTest(unittest.TestCase):
         self.assertIn("required, no implicit default; the constitution wins", text)
         self.assertIn("0 is valid only where the constitution allows a solo project", text)
 
+    def test_body_states_purpose_then_steps_in_order(self):
+        body = roadmap_issues.spec_plan_body({"id": "008", "title": "Example"}, "specs/008-example")
+        self.assertIn("**Purpose:** write and get approval", body)
+        steps = body.split("**What to do, in order**")[1].split("**Rules that apply")[0]
+        self.assertLess(steps.index("gh issue develop"), steps.index("`speckit-specify`"))
+        self.assertLess(steps.index("`speckit-specify`"), steps.index("`speckit-clarify`"))
+        self.assertLess(steps.index("`speckit-clarify`"), steps.index("`speckit-plan`"))
+        self.assertIn("Do not run `speckit-tasks` on this branch", body)
+
 
 SECTION = "# Roadmap\n\n## Planned Specs\n\n"
 
