@@ -478,9 +478,134 @@ class AgentSetupTest(unittest.TestCase):
 
         self.assertEqual(0, code)
         self.assertIn(
-            "Generated sub-agents for all tools; run npm run setup-agents to choose yours.",
+            "Generated sub-agents for all tools (Claude Code, GitHub Copilot, Codex). "
+            "Optional: run npm run setup-agents to keep only the ones you use; "
+            "run it again whenever you change coding agents.",
             output,
         )
+
+    def ask_tools_run(self, answers, current=()):
+        replies = iter(answers)
+        prompts = []
+
+        def ask(prompt):
+            prompts.append(prompt)
+            return next(replies)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            chosen = setup.ask_tools(ask, current)
+        return chosen, output.getvalue(), prompts
+
+    def test_ask_tools_shows_menu_and_returns_numbers_in_tool_order(self):
+        chosen, output, prompts = self.ask_tools_run(["3, 1"])
+
+        self.assertEqual(["copilot", "codex"], chosen)
+        self.assertIn("1) GitHub Copilot", output)
+        self.assertIn("2) Claude Code", output)
+        self.assertIn("3) Codex", output)
+        self.assertEqual(["Choice [Enter keeps current]: "], prompts)
+
+    def test_ask_tools_accepts_names_and_spaces(self):
+        chosen, _, _ = self.ask_tools_run(["Claude codex"])
+
+        self.assertEqual(["claude", "codex"], chosen)
+
+    def test_ask_tools_enter_returns_all_tools_when_nothing_is_saved(self):
+        chosen, output, _ = self.ask_tools_run([""])
+
+        self.assertEqual(["claude", "copilot", "codex"], chosen)
+        self.assertIn("Current choice: none (all tools are generated)", output)
+
+    def test_ask_tools_enter_returns_the_saved_choice(self):
+        chosen, output, _ = self.ask_tools_run([""], current=["codex"])
+
+        self.assertEqual(["codex"], chosen)
+        self.assertIn("Current choice: codex\n", output)
+
+    def test_ask_tools_asks_again_on_invalid_input(self):
+        chosen, _, prompts = self.ask_tools_run(["9", "cursor", "²", "2"])
+
+        self.assertEqual(["claude"], chosen)
+        self.assertEqual(4, len(prompts))
+
+    def test_ask_tools_returns_none_on_cancel(self):
+        for error in (EOFError, KeyboardInterrupt):
+            with self.subTest(error.__name__):
+
+                def ask(prompt, error=error):
+                    raise error()
+
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    chosen = setup.ask_tools(ask, ())
+
+                self.assertIsNone(chosen)
+                self.assertIn("\nCancelled; nothing changed.", output.getvalue())
+
+    def test_save_tools_writes_git_config(self):
+        self.git("init")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            saved = setup.save_tools(self.root, ["claude", "codex"])
+
+        self.assertTrue(saved)
+        self.assertEqual("claude,codex", self.configured())
+        local = subprocess.run(
+            ["git", "config", "--local", "--get", "agent-setup.tools"],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual("claude,codex", local.stdout.strip())
+
+    def test_save_tools_reports_a_failed_save(self):
+        output = io.StringIO()
+        with mock.patch.object(
+            setup.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "boom"),
+        ), contextlib.redirect_stdout(output):
+            saved = setup.save_tools(self.root, ["claude"])
+
+        self.assertFalse(saved)
+        self.assertIn("::error::could not save the choice: boom", output.getvalue())
+
+    def test_setup_ends_with_the_rerun_line(self):
+        self.git("init")
+
+        code, output, _ = self.setup_run(["2"])
+
+        self.assertEqual(0, code)
+        self.assertTrue(
+            output.rstrip().endswith(
+                "Run npm run setup-agents again whenever you change coding agents, "
+                "to generate the files for the new ones."
+            )
+        )
+
+    def test_setup_does_not_print_the_rerun_line_when_sync_fails(self):
+        self.git("init")
+
+        with mock.patch.object(setup, "run_sync", return_value=1):
+            _, output, _ = self.setup_run(["2"])
+
+        self.assertNotIn("again whenever you change", output)
+
+    def test_setup_stops_when_the_choice_cannot_be_saved(self):
+        # Characterization test: run_setup already returns 1 on a failed save.
+        self.git("init")
+
+        with mock.patch.object(setup, "save_tools", return_value=False), mock.patch.object(
+            setup, "run_sync"
+        ) as sync:
+            code, output, _ = self.setup_run(["2"])
+
+        self.assertEqual(1, code)
+        self.assertNotIn("Saved:", output)
+        self.assertNotIn("again whenever you change", output)
+        sync.assert_not_called()
 
     def test_sync_does_not_hint_when_a_selection_exists(self):
         self.git("init")
@@ -545,7 +670,7 @@ class AgentSetupTest(unittest.TestCase):
         self.assertIn("1) GitHub Copilot", output)
         self.assertIn("2) Claude Code", output)
         self.assertIn("3) Codex", output)
-        self.assertNotIn("setup-agents", output)
+        self.assertNotIn("Generated sub-agents for all tools", output)
 
     def test_setup_accepts_names_and_spaces(self):
         self.git("init")

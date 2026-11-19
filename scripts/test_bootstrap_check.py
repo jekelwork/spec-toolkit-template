@@ -33,7 +33,10 @@ class CheckGitHub(FakeGitHub):
             self.calls.append(list(argv))
             raise bootstrap.CommandError("cannot run gh: No such file or directory")
         if argv[:3] == ["gh", "auth", "status"]:
+            assert argv[3:] == ["--active", "--hostname", "github.com"], argv
             self.calls.append(list(argv))
+            if self.gh == "old":
+                raise bootstrap.CommandError("unknown flag: --active\nUsage: gh auth status")
             if self.gh == "logged-out":
                 raise bootstrap.CommandError("You are not logged into any GitHub hosts.")
             return "Logged in\n"
@@ -180,6 +183,12 @@ class GitHubStepTest(CheckTestCase):
         self.assertIn("gh auth login", self.out)
         self.assertIn("–", self.line("GitHub settings"))
 
+    def test_an_old_gh_asks_for_an_upgrade_not_a_login(self):
+        self.write()
+        self.assertEqual(self.check(CheckGitHub(gh="old")), 0)
+        self.assertIn("2.40", self.out)
+        self.assertNotIn("not logged in", self.line("GitHub settings"))
+
     def test_a_github_error_is_a_failure_not_a_crash(self):
         self.write()
         self.assertEqual(self.check(CheckGitHub(board=False)), 1)
@@ -269,6 +278,16 @@ class AgentStepTest(CheckTestCase):
         self.assertEqual(self.check(self.configured_github()), 1)
         self.assertIn("not generated", self.line("gent"))
         self.assertIn("agent_setup.py sync", self.out)
+
+    def test_only_missing_or_outdated_files_are_fixable_by_sync(self):
+        self.write()
+        self.assertFalse(bootstrap_check.check_agents(self.root).fixable_by_sync)
+        (self.root / ".claude" / "agents" / "a.md").write_text("old")
+        self.assertTrue(bootstrap_check.check_agents(self.root).fixable_by_sync)
+        (self.root / ".claude" / "agents" / "a.md").unlink()
+        self.assertTrue(bootstrap_check.check_agents(self.root).fixable_by_sync)
+        bootstrap_check.agent_setup.find_problems.return_value = ["bad"]
+        self.assertFalse(bootstrap_check.check_agents(self.root).fixable_by_sync)
 
     def test_no_agent_definitions_fail(self):
         self.write()

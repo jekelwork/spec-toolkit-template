@@ -5,6 +5,8 @@ Subcommands (no subcommand runs check):
   check   report where you are and what to do next (read-only)
   init    write project-context.toml
   github  preview (default), --apply or --check the GitHub settings (labels, board, ruleset)
+  start   work through the bootstrap steps, previewing and confirming each one
+          (`start --help` lists its options)
 """
 
 import argparse
@@ -18,6 +20,8 @@ import tempfile
 
 import bootstrap_check
 import bootstrap_github
+import bootstrap_start
+import bootstrap_steps
 import project_context
 # Re-exported: callers and tests use bootstrap.CommandError; it is defined in bootstrap_github
 # because bootstrap imports that module (defining it here would be a circular import).
@@ -38,8 +42,8 @@ URL_REMOTE = re.compile(
 FLAG_MESSAGES = (
     ("github_project", "owner", "--owner", "must be a GitHub owner login"),
     ("github_project", "number", "--project-number", "must be a positive integer"),
-    ("project", "name", "--name", "must be a non-empty string"),
-    ("project", "description", "--description", "must be a non-empty string"),
+    ("project", "name", "--name", project_context.SINGLE_LINE_MESSAGE),
+    ("project", "description", "--description", project_context.SINGLE_LINE_MESSAGE),
     ("review", "required_approvals", "--required-approvals", "must be a non-negative integer"),
 )
 NEXT_STEPS = """\
@@ -59,7 +63,8 @@ def run_command(argv, cwd=None):
     except OSError as error:
         raise CommandError(f"cannot run {argv[0]}: {error}") from error
     if result.returncode != 0:
-        raise CommandError(result.stderr.strip() or f"{' '.join(argv[:3])} failed")
+        raise CommandError(result.stderr.strip() or f"{' '.join(argv[:3])} failed",
+                           stdout=result.stdout, returncode=result.returncode)
     return result.stdout
 
 
@@ -143,20 +148,31 @@ def create_board(owner, title, run):
 
 
 def validate(context):
-    """Run the shared validation on the context as it would be written."""
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / CONFIG_NAME
-        path.write_text(emit_toml(context), encoding="utf-8")
-        try:
-            project_context.load_context(path)
-        except ValueError as error:
-            for section, key, flag, requirement in FLAG_MESSAGES:
-                if str(error).startswith(f"{section}.{key}"):
-                    value = repr(context[section][key])  # repr keeps it on one line
-                    if len(value) > 80:
-                        value = value[:77] + "..."
-                    raise ValueError(f"{flag}: {value} {requirement}") from error
-            raise
+    """Run the shared validation on the context as it would be written (in memory, no files)."""
+    def shown(section, key):
+        value = repr(context[section][key])  # repr keeps it on one line
+        return value[:77] + "..." if len(value) > 80 else value
+
+    text = emit_toml(context)
+    try:
+        text.encode("utf-8")  # a value that cannot be written (a lone surrogate) is rejected
+    except UnicodeEncodeError as error:
+        for section, key, flag, _ in FLAG_MESSAGES:
+            value = context.get(section, {}).get(key)
+            if isinstance(value, str):
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise ValueError(f"{flag}: {shown(section, key)} contains characters "
+                                     "that cannot be written as UTF-8") from error
+        raise ValueError("a value contains characters that cannot be written as UTF-8") from error
+    try:
+        project_context.parse_context(text)
+    except ValueError as error:
+        for section, key, flag, requirement in FLAG_MESSAGES:
+            if str(error).startswith(f"{section}.{key}"):
+                raise ValueError(f"{flag}: {shown(section, key)} {requirement}") from error
+        raise
 
 
 def check_writable(directory):
@@ -199,10 +215,23 @@ def write_atomically(path, text, overwrite):
 
 
 def remote_defaults(root, run):
+    """(owner, repository) of `origin`, None when it is not a GitHub remote or cannot be read."""
     try:
         return parse_remote(run(["git", "remote", "get-url", "origin"], cwd=root))
     except CommandError:
         return None
+
+
+def push_remote_defaults(root, run):
+    """(owner, repository) of every push URL of `origin` (`git push` goes to all of them; with
+    none set it is the fetch URL), in order; None for a URL that is not a GitHub remote. A
+    listing that cannot be read, or is empty, is one unknown remote: `[None]`."""
+    try:
+        lines = run(["git", "remote", "get-url", "--push", "--all", "origin"], cwd=root)
+    except CommandError:
+        return [None]
+    urls = [line for line in lines.splitlines() if line.strip()]
+    return [parse_remote(url) for url in urls] or [None]
 
 
 def init(args, root, run, is_tty, prompt):
@@ -298,8 +327,11 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     commands = parser.add_subparsers(dest="command")
     commands.default = "check"  # a plain `bootstrap.py` runs check
-    commands.add_parser(
+    check_parser = commands.add_parser(
         "check", help="report setup status and the next step (read-only; also the default)"
+    )
+    check_parser.add_argument(
+        "--json", action="store_true", help="print the machine-readable report as JSON"
     )
     init_parser = commands.add_parser("init", help="write project-context.toml")
     init_parser.add_argument("--name", help="project name (default: repository name)")
@@ -336,14 +368,41 @@ def build_parser():
         help="let --apply lower the ruleset's approvals or turn off last-push approval "
         "(refused and reported otherwise)",
     )
+    # listed for `--help` only: `main` hands everything after `start` to bootstrap_start.py, which
+    # owns the options (argparse cannot pass option-like arguments through a subparser)
+    commands.add_parser(
+        "start",
+        help="work through the bootstrap steps: start [--no-input] "
+        "[--agents TOOL,...] [--confirm STEP_ID@DIGEST [--issue N] [--guided]] [init flags]",
+        add_help=False,
+    )
     return parser
 
 
-def main(argv=None, *, root=ROOT, run=run_command, is_tty=None, prompt=input):
-    args = build_parser().parse_args(argv)
+def main(argv=None, *, root=ROOT, run=run_command, is_tty=None, prompt=input,
+         run_captured=None):
+    """`run_captured` (argv, cwd) -> returncode, stdout, stderr is `start`'s runner for the
+    first-sync dry run, whose stderr it shows; with the real `run` it is the real one."""
+    given = list(sys.argv[1:] if argv is None else argv)
+    if given[:1] == ["start"]:
+        args = argparse.Namespace(command="start", start_arguments=given[1:])
+    else:
+        args = build_parser().parse_args(given)
     if is_tty is None:
         is_tty = sys.stdin.isatty()
     try:
+        if args.command == "check" and getattr(args, "json", False):
+            try:
+                report = bootstrap_steps.build_report(
+                    Path(root), run, lambda: remote_defaults(Path(root), run),
+                    lambda: push_remote_defaults(Path(root), run),
+                )
+                document = json.dumps(report)
+            except Exception as error:  # the contract: 2 means no report, never a traceback
+                print(f"bootstrap check failed: {error}", file=sys.stderr)
+                return 2
+            print(document)
+            return 1 if report["result"] == "incomplete" else 0
         if args.command == "check":
             return bootstrap_check.run_check(
                 args, Path(root), run, lambda: remote_defaults(Path(root), run)
@@ -352,13 +411,22 @@ def main(argv=None, *, root=ROOT, run=run_command, is_tty=None, prompt=input):
             return bootstrap_github.run_github(
                 args, Path(root), run, lambda: remote_defaults(Path(root), run)
             )
+        if args.command == "start":
+            return bootstrap_start.main(
+                args.start_arguments, root=Path(root), run=run, is_tty=is_tty, prompt=prompt,
+                remote_default=lambda: remote_defaults(Path(root), run),
+                push_remote_default=lambda: push_remote_defaults(Path(root), run),
+                init=init, validate=validate, toml_string=toml_string,
+                run_captured=run_captured or (
+                    bootstrap_start.run_captured if run is run_command else None))
         init(args, Path(root), run, is_tty, prompt)
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
     except (CommandError, OSError, ValueError) as error:
         print(f"bootstrap {args.command} failed: {error}", file=sys.stderr)
-        return 2 if args.command == "github" else 1
+        json_check = args.command == "check" and getattr(args, "json", False)
+        return 2 if args.command in ("github", "start") or json_check else 1
     return 0
 
 

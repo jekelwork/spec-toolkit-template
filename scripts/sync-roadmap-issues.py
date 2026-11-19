@@ -622,16 +622,18 @@ def sync_dependencies(api, source_ids, entries_by_id, issue_map, apply):
     }
     managed_issue_by_number = {issue["number"]: issue for issue in epic_by_id.values()}
 
-    for roadmap_id in source_ids:
+    # sorted: the dry run's stdout must not depend on set order (hash randomisation), because
+    # `bootstrap.py start` hashes it and recomputes the hash in a later process
+    for roadmap_id in sorted(source_ids):
         epic = issue_map.get(roadmap_id, (None, {}))[0]
         entry = entries_by_id.get(roadmap_id)
         if not epic:
             if not apply and entry and entry["status"] in {
                 "planned", "needs-info"
             }:
-                for dependency in set(
+                for dependency in sorted(set(
                     re.findall(r"\b\d{3}\b", entry["fields"].get("Depends on", ""))
-                ):
+                )):
                     if dependency in epic_by_id:
                         dry_run(
                             f"make new epic for {roadmap_id} blocked by "

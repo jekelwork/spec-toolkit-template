@@ -8,11 +8,29 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bootstrap  # noqa: E402
+import bootstrap_start  # noqa: E402
+import bootstrap_steps  # noqa: E402
 import project_context  # noqa: E402
+import test_bootstrap_check  # noqa: E402
+
+
+class _LazyModule:
+    """`test_bootstrap_start` imports this module (through test_bootstrap_steps), so it is
+    imported on first use."""
+
+    def __getattr__(self, name):
+        import test_bootstrap_start as module
+        return getattr(module, name)
+
+
+test_bootstrap_start = _LazyModule()
+from test_bootstrap_github import (  # noqa: E402
+    FakeGitHub, has_field, has_input, is_mutation, rest_methods)
 
 
 class FakeRun:
@@ -322,9 +340,16 @@ class InitValidationTest(BootstrapTestCase):
         for args, expected in (
             (("--owner", "-bad"), "--owner: '-bad' must be a GitHub owner login"),
             (("--owner", "has space"), "--owner: 'has space' must be a GitHub owner login"),
-            (("--name", "   "), "--name: '   ' must be a non-empty string"),
-            (("--description", "  "), "--description: '  ' must be a non-empty string"),
-            (("--description", ""), "--description: '' must be a non-empty string"),
+            (("--name", "   "), "--name: '   ' must be a non-empty single-line string "
+                                "without control characters"),
+            (("--description", "  "), "--description: '  ' must be a non-empty single-line "
+                                     "string without control characters"),
+            (("--description", ""), "--description: '' must be a non-empty single-line "
+                                    "string without control characters"),
+            (("--description", "a\x85b"), "--description: 'a\\x85b' must be a non-empty "
+                                          "single-line string without control characters"),
+            (("--name", "a\u2028b"), "--name: 'a\\u2028b' must be a non-empty single-line "
+                                     "string without control characters"),
             (("--project-number", "0"), "--project-number: 0 must be a positive integer"),
             (("--required-approvals", "-1"), "--required-approvals: -1 must be a non-negative integer"),
         ):
@@ -339,6 +364,25 @@ class InitValidationTest(BootstrapTestCase):
                 self.assertIn(expected, self.err)
                 self.assertFalse(self.target.exists())
 
+    def test_bidi_controls_are_rejected_before_writing(self):
+        for flag in ("--name", "--description"):
+            for char in ("\U0000202a", "\U0000202e", "\U00002066", "\U00002069"):
+                with self.subTest(flag=flag, character=f"U+{ord(char):04X}"):
+                    base = {"--name": "N", "--description": "D", "--owner": "acme",
+                            "--project-number": "1", "--required-approvals": "1"}
+                    base[flag] = f"a{char}b"
+                    code = self.init(*[f"{k}={v}" for k, v in base.items()])
+                    self.assertEqual(code, 1)
+                    self.assertIn(f"{flag}: 'a\\u{ord(char):04x}b' must be a non-empty "
+                                  "single-line string without control characters", self.err)
+                    self.assertFalse(self.target.exists())
+
+    def test_zero_width_joiner_and_soft_hyphen_still_pass(self):
+        joined = "\U0001f468\U0000200d\U0001f469 co\U000000adoperate"
+        code = self.init("--name", joined, "--description", joined, "--project-number", "1")
+        self.assertEqual(code, 0, self.err)
+        self.assertEqual(self.written()["project"]["name"], joined)
+
     def test_non_numeric_numbers_are_rejected(self):
         for flag in ("--project-number", "--required-approvals"):
             with self.subTest(flag=flag):
@@ -350,10 +394,62 @@ class InitValidationTest(BootstrapTestCase):
                 self.assertFalse(self.target.exists())
 
     def test_hostile_description_is_written_safely(self):
-        hostile = 'He said "hi"\\\nsecond line\n[evil]\nkey = 1'
+        hostile = 'He said "hi"\\ second line [evil] key = 1 \u00e4'
         code = self.init("--description", hostile, "--project-number", "1")
         self.assertEqual(code, 0, self.err)
         self.assertEqual(self.written()["project"]["description"], hostile)
+
+
+class ValidateInMemoryTest(unittest.TestCase):
+    """`validate` is read-only and does no file I/O (it runs before any preview)."""
+
+    CONTEXT = {"project": {"name": "N", "description": "D"},
+               "github_project": {"owner": "acme", "number": 1},
+               "review": {"required_approvals": 1}}
+
+    def forbidden(self):
+        message = "validate must not touch the file system"
+        return (mock.patch("tempfile.TemporaryDirectory", side_effect=AssertionError(message)),
+                mock.patch("tempfile.mkstemp", side_effect=AssertionError(message)),
+                mock.patch.object(Path, "write_text", side_effect=AssertionError(message)),
+                mock.patch.object(Path, "read_bytes", side_effect=AssertionError(message)))
+
+    def test_a_valid_context_passes_without_file_io(self):
+        with contextlib.ExitStack() as stack:
+            for patch in self.forbidden():
+                stack.enter_context(patch)
+            bootstrap.validate(self.CONTEXT)
+
+    def test_a_value_that_cannot_be_written_is_rejected_as_before(self):
+        context = {**self.CONTEXT, "project": {"name": "w\udc80", "description": "D"}}
+
+        with self.assertRaises(ValueError) as raised:
+            bootstrap.validate(context)
+        self.assertEqual("--name: 'w\\udc80' contains characters that cannot be written as UTF-8",
+                         str(raised.exception))
+
+    def test_the_unwritable_value_names_its_own_flag(self):
+        for section, key, flag in (("project", "description", "--description"),
+                                   ("github_project", "owner", "--owner")):
+            with self.subTest(flag=flag):
+                context = {**self.CONTEXT, section: {**self.CONTEXT[section], key: "x\udc80"}}
+
+                with self.assertRaises(ValueError) as raised:
+                    bootstrap.validate(context)
+
+                self.assertTrue(str(raised.exception).startswith(f"{flag}: "))
+                self.assertIn("cannot be written as UTF-8", str(raised.exception))
+                self.assertNotIn("codec", str(raised.exception))
+
+    def test_an_invalid_context_keeps_its_flag_message_without_file_io(self):
+        context = {**self.CONTEXT, "review": {"required_approvals": -1}}
+        with contextlib.ExitStack() as stack:
+            for patch in self.forbidden():
+                stack.enter_context(patch)
+            with self.assertRaises(ValueError) as raised:
+                bootstrap.validate(context)
+        self.assertEqual("--required-approvals: -1 must be a non-negative integer",
+                         str(raised.exception))
 
 
 class CreateBoardTest(BootstrapTestCase):
@@ -372,6 +468,16 @@ class CreateBoardTest(BootstrapTestCase):
         with self.assertRaises(SystemExit) as raised, contextlib.redirect_stderr(io.StringIO()):
             self.init("--description", "D", "--create-board", "--project-number", "1")
         self.assertEqual(raised.exception.code, 2)
+
+    def test_a_name_that_cannot_be_written_never_creates_a_board(self):
+        run = FakeRun(remote="git@github.com:acme/widgets.git")
+        code = self.init("--description", "D", "--create-board", "--name", "w\udc80", run=run)
+        self.assertEqual(code, 1)
+        self.assertIn("--name:", self.err)
+        self.assertIn("cannot be written as UTF-8", self.err)
+        self.assertNotIn("codec", self.err)
+        self.assertEqual([c for c in run.calls if c[:3] == ["gh", "project", "create"]], [])
+        self.assertFalse(self.target.exists())
 
     def test_invalid_input_never_creates_a_board(self):
         run = FakeRun(remote="git@github.com:acme/widgets.git")
@@ -520,6 +626,583 @@ class CliTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised, contextlib.redirect_stderr(io.StringIO()):
             bootstrap.main(["nope"])
         self.assertEqual(raised.exception.code, 2)
+
+
+READ_COMMANDS = (
+    ["gh", "auth", "status"], ["gh", "repo", "view"], ["gh", "api"], ["gh", "issue", "list"],
+    ["gh", "pr", "list"], ["gh", "pr", "view"], ["gh", "label", "list"], ["gh", "secret", "list"],
+    ["gh", "variable", "list"], ["git", "remote", "get-url"], ["git", "branch", "--show-current"],
+    ["git", "branch", "--format=%(refname:short)"], ["git", "status", "--porcelain"],
+    ["git", "rev-parse"], ["git", "merge-base", "--is-ancestor"], ["git", "cat-file", "-e"],
+    # the first-sync dry run: the script without --apply (is_read rejects any argv with it)
+    ["python3", "scripts/sync-roadmap-issues.py"],
+)
+
+
+def is_read(argv, body=None):
+    """True when argv starts with an allowlisted read command (an allowlist, not a denylist).
+
+    `gh_json` sends every GraphQL body with `--input`, queries and mutations alike, so a
+    `gh api graphql` call is a read only when its `body` (captured at call time, as the temp
+    file is deleted after the call) holds no mutation.
+    """
+    if not any(argv[: len(prefix)] == prefix for prefix in READ_COMMANDS):
+        return False
+    if argv[0] == "python3" and (argv[1:] not in (["scripts/sync-roadmap-issues.py"],
+                                                  ["scripts/sync-roadmap-issues.py",
+                                                   "--skip-project"])):
+        return False  # only the exact dry-run argv; never --apply or anything else
+    if argv[:2] == ["gh", "api"]:
+        if has_field(argv):
+            return False
+        if has_input(argv):
+            # a REST body makes the call a POST without -X
+            return argv[:3] == ["gh", "api", "graphql"] and not is_mutation(body)
+        if any(method.upper() != "GET" for method in rest_methods(argv)):
+            return False
+    return True
+
+
+class IsReadTest(unittest.TestCase):
+    """The read allowlist must reject every REST write spelling of `gh api`."""
+
+    def test_the_first_sync_reads_are_reads_but_apply_never_is(self):
+        for argv in (["git", "rev-parse", "HEAD"], ["git", "cat-file", "-e", "abc^{commit}"],
+                     ["git", "merge-base", "--is-ancestor", "a", "HEAD"],
+                     ["gh", "pr", "list", "--repo", "o/r"],
+                     ["gh", "pr", "view", "5", "--repo", "o/r", "--json", "headRefOid"],
+                     ["python3", "scripts/sync-roadmap-issues.py"],
+                     ["python3", "scripts/sync-roadmap-issues.py", "--skip-project"]):
+            with self.subTest(argv=argv):
+                self.assertTrue(is_read(argv))
+        for argv in (["python3", "scripts/sync-roadmap-issues.py", "--apply"],
+                     ["python3", "scripts/sync-roadmap-issues.py", "--skip-project", "--apply"],
+                     ["python3", "scripts/other.py"], ["git", "merge-base", "HEAD"] + ["--x"]):
+            with self.subTest(argv=argv):
+                self.assertFalse(is_read(argv))
+
+    def test_gh_api_writes_are_not_reads(self):
+        for argv in (
+            ["gh", "api", "repos/o/r/rulesets", "--input", "f.json"],
+            ["gh", "api", "repos/o/r/rulesets", "-X", "POST"],
+            ["gh", "api", "repos/o/r/rulesets", "-XPOST"],
+            ["gh", "api", "repos/o/r/rulesets", "--method", "PUT"],
+            ["gh", "api", "repos/o/r/rulesets", "--method=DELETE"],
+            ["gh", "api", "repos/o/r/rulesets", "-f", "a=b"],
+            ["gh", "api", "repos/o/r/rulesets", "--input=f.json"],
+            ["gh", "api", "repos/o/r/rulesets", "--field=a=b"],
+            ["gh", "api", "repos/o/r/rulesets", "--raw-field=a=b"],
+            ["gh", "api", "repos/o/r/rulesets", "-fa=b"],
+            ["gh", "api", "repos/o/r/rulesets", "-Fa=b"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertFalse(is_read(argv))
+
+    def test_a_graphql_mutation_is_not_a_read(self):
+        argv = ["gh", "api", "graphql", "--input", "f.json"]
+        self.assertFalse(is_read(argv, {"query": "mutation { x }"}))
+        self.assertFalse(is_read(argv, None))  # an unreadable body is not known to be a query
+
+    def test_the_fakes_capture_the_graphql_body_before_the_file_disappears(self):
+        for fake in (RecordingRun(), ReadingRun()):
+            with self.subTest(fake=type(fake).__name__), \
+                    tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "body.json"
+                path.write_text(json.dumps({"query": "mutation { x }", "variables": {}}))
+                try:
+                    fake(["gh", "api", "graphql", "--input", str(path)])
+                except (bootstrap.CommandError, KeyError, AssertionError):
+                    pass  # only the recording matters here, not the fake's answer
+                path.unlink()
+                self.assertEqual(1, len(fake.calls))
+                self.assertFalse(is_read(fake.calls[0], fake.bodies[0]))
+
+    def test_gh_api_reads_are_reads(self):
+        for argv in (
+            ["gh", "api", "repos/o/r/rulesets"],
+            ["gh", "api", "repos/o/r/rulesets", "-X", "GET"],
+            ["gh", "api", "repos/o/r/rulesets", "--method=GET"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(is_read(argv))
+
+    def test_a_graphql_query_is_a_read(self):
+        argv = ["gh", "api", "graphql", "--input", "f.json"]
+        self.assertTrue(is_read(argv, {"query": "query { viewer { id } }"}))
+
+
+class RecordingRun:
+    """Records every command and fails each one as an unreachable gh or git would."""
+
+    def __init__(self):
+        self.calls = []
+        self.bodies = {}  # call index -> body, read before the temp file goes
+
+    def __call__(self, argv, cwd=None):
+        self.bodies[len(self.calls)] = FakeGitHub.body(list(argv))
+        self.calls.append(list(argv))
+        raise bootstrap.CommandError(f"cannot run {argv[0]}: No such file or directory")
+
+
+class ReadingRun(test_bootstrap_check.CheckGitHub):
+    """A gh and git that answer every read, so the real builder runs past its first calls.
+
+    Commands outside the answers below are recorded and then fail, so nothing a builder adds
+    can go unseen by the allowlist.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.extra_calls = []
+        self.bodies = {}  # call index -> body, read before the temp file goes
+
+    def __call__(self, argv, cwd=None):
+        argv = list(argv)
+        self.bodies[len(self.calls)] = FakeGitHub.body(argv)
+        answers = (
+            (["git", "remote", "get-url"], "https://github.com/acme/widgets.git\n"),
+            (["gh", "api", "user"], "tester\n"),
+            (["gh", "issue", "list"], "[]"),
+            (["git", "branch", "--show-current"], "main\n"),
+            (["git", "branch", "--format=%(refname:short)"], "main\n"),
+            (["git", "status", "--porcelain"], ""),
+        )
+        for prefix, answer in answers:
+            if argv[: len(prefix)] == prefix:
+                self.calls.append(argv)
+                return answer
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            self.calls.append(argv)
+            return "main\n"
+        try:
+            return super().__call__(argv, cwd)
+        except AssertionError:  # an unanswered command: already recorded by FakeGitHub
+            raise bootstrap.CommandError(f"unanswered command {argv}")
+
+
+def report(result="incomplete", state="todo"):
+    """A minimal report in the shape of contracts/check-json.md (format version 1)."""
+    return {
+        "format_version": 1, "result": result, "next_step": None, "bootstrap_merged": False,
+        "default_branch": "main",
+        "steps": [{"id": "prerequisites", "title": "t", "state": state, "blocking": True,
+                   "actor": "user", "needs_decision": False, "needs_confirmation": False,
+                   "performable": False, "bypasses_review": False, "action": None,
+                   "details": {}}],
+    }
+
+
+class CheckJsonTest(unittest.TestCase):
+    """`check --json`: the report builder is bootstrap_steps.build_report(root, run,
+    remote_default) -> dict; the CLI serialises it with json.dumps (contracts/check-json.md)."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+
+    def check_json(self, build=None, run=None):
+        run = run or RecordingRun()
+        out, err = io.StringIO(), io.StringIO()
+        patched = (mock.patch.object(bootstrap_steps, "build_report", build, create=True)
+                   if build else contextlib.nullcontext())
+        with patched, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = bootstrap.main(["check", "--json"], root=self.root, run=run, is_tty=False)
+        self.out, self.err, self.run = out.getvalue(), err.getvalue(), run
+        return code
+
+    def test_prints_exactly_one_json_document_on_stdout(self):
+        code = self.check_json(lambda root, run, remote_default, push_remote_default=None: report())
+        self.assertEqual(code, 1)
+        document = json.loads(self.out)  # raises when stdout holds anything else
+        self.assertEqual(document, report())
+        self.assertNotIn("Bootstrap status", self.out)
+
+    def test_an_unexpected_error_in_the_builder_prints_to_stderr_only_and_exits_2(self):
+        def build(root, run, remote_default, push_remote_default=None):
+            raise KeyError("surprise")
+
+        code = self.check_json(build)
+
+        self.assertEqual(2, code)
+        self.assertEqual("", self.out)
+        self.assertIn("surprise", self.err)
+
+    def test_exit_code_follows_the_result(self):
+        for result, state, expected in (
+            ("complete", "done", 0),
+            ("complete_with_manual_settings", "manual", 0),
+            ("incomplete", "todo", 1),
+        ):
+            with self.subTest(result=result):
+                code = self.check_json(
+                    lambda root, run, remote_default, push_remote_default=None: report(result, state))
+                self.assertEqual(code, expected)
+                self.assertEqual(json.loads(self.out)["result"], result)
+
+    def test_the_builder_receives_root_run_and_the_remote_default_lookup(self):
+        seen = {}
+
+        def build(root, run, remote_default, push_remote_default=None):
+            seen.update(root=Path(root), run=run, remote_default=remote_default)
+            return report()
+
+        run = RecordingRun()
+        self.check_json(build, run)
+        self.assertEqual(seen["root"], self.root)
+        self.assertIs(seen["run"], run)
+        self.assertTrue(callable(seen["remote_default"]))
+
+    def test_no_report_means_exit_2_with_the_message_on_stderr_and_nothing_on_stdout(self):
+        for error in (bootstrap.CommandError("boom"), ValueError("boom"), OSError("boom")):
+            def build(root, run, remote_default, push_remote_default=None, error=error):
+                raise error
+
+            with self.subTest(error=type(error).__name__):
+                code = self.check_json(build)
+                self.assertEqual(code, 2)
+                self.assertEqual(self.out, "")
+                self.assertIn("boom", self.err)
+
+    def test_gh_missing_gives_not_checked_github_steps_and_exit_1(self):
+        (self.root / "project-context.toml").write_text(
+            test_bootstrap_check.CONTEXT.format(approvals=1))
+        code = self.check_json(run=test_bootstrap_check.CheckGitHub(gh="missing"))
+        self.assertEqual(code, 1)
+        document = json.loads(self.out)
+        self.assertEqual(document["format_version"], 1)
+        self.assertEqual(document["result"], "incomplete")
+        steps = {step["id"]: step for step in document["steps"]}
+        self.assertEqual(len(document["steps"]), 11)
+        for step_id in ("github_settings", "first_sync"):
+            self.assertEqual(steps[step_id]["state"], "not_checked", step_id)
+            self.assertTrue(steps[step_id]["title"])
+
+    def test_gh_logged_out_gives_not_checked_github_steps_and_exit_1(self):
+        run = test_bootstrap_check.CheckGitHub(gh="logged-out")
+        code = self.check_json(run=run)
+        self.assertEqual(code, 1)
+        steps = {step["id"]: step for step in json.loads(self.out)["steps"]}
+        self.assertEqual(steps["github_settings"]["state"], "not_checked")
+        self.assertEqual(steps["first_sync"]["state"], "not_checked")
+
+    def assert_only_reads(self, run):
+        for index, call in enumerate(run.calls):
+            self.assertTrue(is_read(call, run.bodies.get(index)),
+                            f"not an allowlisted read: {call}")
+
+    def test_with_every_command_failing_the_builder_issues_only_allowlisted_reads(self):
+        (self.root / "project-context.toml").write_text("[project]\nname = \"x\"\n")
+        before = test_bootstrap_check.snapshot(self.root)
+        self.assertEqual(self.check_json(), 1)
+        self.assert_only_reads(self.run)
+        self.assertEqual(test_bootstrap_check.snapshot(self.root), before)
+
+    def test_with_every_read_succeeding_the_builder_reaches_its_reads_and_writes_nothing(self):
+        # A failing fake stops the builder at its first reads; this run lets it go through
+        # every step, so a write added anywhere in the builder is recorded.
+        (self.root / "project-context.toml").write_text(
+            test_bootstrap_check.CONTEXT.format(approvals=1))
+        (self.root / ".specify" / "memory").mkdir(parents=True)
+        (self.root / ".specify" / "memory" / "constitution.md").write_text("# C\n")
+        (self.root / "ROADMAP.md").write_text(test_bootstrap_check.ROADMAP)
+        (self.root / ".claude" / "agents").mkdir(parents=True)
+        (self.root / ".claude" / "agents" / "a.md").write_text("x")
+        files = ({Path(".claude/agents/a.md"): "x"}, [])
+        for target, value in (("find_problems", []), ("expected_agent_files", files)):
+            patcher = mock.patch.object(
+                test_bootstrap_check.bootstrap_check.agent_setup, target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        before = test_bootstrap_check.snapshot(self.root)
+        run = ReadingRun()
+        self.assertIn(self.check_json(run=run), (0, 1))
+        self.assertEqual(len(json.loads(self.out)["steps"]), 11)
+        self.assertGreater(len(run.calls), 3, "the builder stopped before reaching its reads")
+        self.assertEqual(run.writes, [])
+        self.assert_only_reads(run)
+        self.assertEqual(test_bootstrap_check.snapshot(self.root), before)
+
+
+class HumanCommandsUnchangedTest(test_bootstrap_check.CheckTestCase):
+    """FR-014, research D1: check, init and github keep their output and exit codes."""
+
+    def test_human_check_prints_the_six_step_report_and_exits_1_on_an_error(self):
+        code = self.check()
+        self.assertEqual(code, 1)
+        lines = self.out.splitlines()
+        self.assertEqual(lines[0], f"Bootstrap status for {self.root}")
+        self.assertEqual(lines[1], "  \u2717 1. project-context.toml is missing")
+        self.assertEqual(lines[2], "       Next: run `python3 scripts/bootstrap.py init`")
+        self.assertEqual(sum(1 for line in lines if line.startswith(("  \u2717", "  \u2013", "  \u2713"))), 6)
+        self.assertIn("Next: run `python3 scripts/bootstrap.py init`. See docs/bootstrap.md.", lines)
+        with self.assertRaises(ValueError):
+            json.loads(self.out)
+
+    def test_human_check_passes_with_exit_0_and_the_wrap_up(self):
+        self.write()
+        run = self.configured_github()
+        self.assertEqual(self.check(run), 0)
+        self.assertIn("If you have not done so yet:", self.out)
+        self.assertIn("gh workflow run sync-roadmap-issues.yml -f apply=true", self.out)
+
+    def test_init_without_a_terminal_defaults_required_approvals_to_0(self):
+        run = FakeRun(remote="https://github.com/acme/widgets.git")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = bootstrap.main(
+                ["init", "--description", "d", "--project-number", "3"],
+                root=self.root, run=run, is_tty=False,
+                prompt=lambda text: self.fail("must not prompt without a terminal"))
+        self.assertEqual(code, 0)
+        with (self.root / "project-context.toml").open("rb") as file:
+            self.assertEqual(tomllib.load(file)["review"]["required_approvals"], 0)
+        self.assertIn(f"Wrote {self.root / 'project-context.toml'}", out.getvalue())
+        self.assertIn("Notice: required_approvals = 0 (solo project).", out.getvalue())
+        self.assertIn("Next steps:", out.getvalue())
+
+    def test_init_failure_exits_1_with_the_flag_named_on_stderr(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = bootstrap.main(["init"], root=self.root, run=FakeRun(), is_tty=False)
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("bootstrap init failed: Project description is required: pass --description",
+                      err.getvalue())
+
+    def test_github_preview_apply_and_check_keep_their_output_and_exit_codes(self):
+        self.write()
+        run = test_bootstrap_check.CheckGitHub()
+        outputs = {}
+        for command, expected in ((("github",), 0), (("github", "--apply"), 0),
+                                  (("github", "--check"), 0)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = bootstrap.main(list(command), root=self.root, run=run, is_tty=False)
+            self.assertEqual(code, expected, command)
+            outputs[command[-1]] = out.getvalue()
+        self.assertIn("Preview only; run with --apply to make these changes.", outputs["github"])
+        self.assertIn("Ruleset: create Default branch protection (required approvals 1)",
+                      outputs["github"])
+        self.assertIn("Applied 14 change(s).", outputs["--apply"])
+        self.assertIn("Nothing to change: labels, board, ruleset and fork PR approval match.",
+                      outputs["--check"])
+
+    def test_github_without_a_project_context_exits_2_on_stderr(self):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = bootstrap.main(["github", "--check"], root=self.root,
+                                  run=test_bootstrap_check.CheckGitHub(), is_tty=False)
+        self.assertEqual(code, 2)
+        self.assertIn("bootstrap github failed: Missing project context", err.getvalue())
+
+
+FIRST_SYNC = "first_sync"
+
+
+def sync_pending():
+    return test_bootstrap_start.report(test_bootstrap_start.step(FIRST_SYNC, action={
+        "text": "Preview the sync, then apply it.", "command": None, "doc": "docs/x"}))
+
+
+class StartSubcommandTest(BootstrapTestCase):
+    """`bootstrap.py start` (T048, T049): the wiring only; the engine has its own tests."""
+
+    def start(self, *args, report=None, run=None, tty=False, prompt=None, **options):
+        report = report or sync_pending()
+        out, err = io.StringIO(), io.StringIO()
+
+        def no_prompt(text):
+            raise AssertionError(f"prompt called: {text}")
+
+        with mock.patch.object(bootstrap_steps, "build_report", return_value=report), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = bootstrap.main(["start", *args], root=self.root,
+                                  run=run or test_bootstrap_start.SyncRun(), is_tty=tty,
+                                  prompt=prompt or no_prompt, **options)
+        self.out, self.err = out.getvalue(), err.getvalue()
+        return code
+
+    def test_the_subcommand_is_listed_and_documented(self):
+        self.assertIn("start", bootstrap.build_parser().format_help())
+        self.assertIn("start", bootstrap.__doc__)
+
+    def test_exit_0_when_bootstrap_is_complete(self):
+        done = test_bootstrap_start.report(test_bootstrap_start.done("prerequisites"))
+
+        self.assertEqual(0, self.start(report=done))
+        self.assertEqual("\nBOOTSTRAP IS COMPLETE\n", self.out[-len("\nBOOTSTRAP IS COMPLETE\n"):])
+        self.assertNotIn("\x1b", self.out)  # captured output is no terminal: nothing is bold
+
+    def test_exit_1_when_stopped_at_a_step_start_does_not_perform(self):
+        stuck = test_bootstrap_start.report(
+            test_bootstrap_start.step("constitution", performable=False))
+
+        self.assertEqual(1, self.start(report=stuck))
+        self.assertIn("Stopped at constitution", self.out)
+
+    def test_exit_2_for_a_malformed_confirm_and_for_a_usage_error(self):
+        self.assertEqual(2, self.start("--confirm", "bare"))
+        self.assertIn("--confirm takes", self.err)
+        self.assertEqual(2, self.start("--issue", "seven"))
+        self.assertIn("--issue", self.err)
+
+    def test_exit_3_prints_the_preview_and_the_confirm_line(self):
+        self.assertEqual(3, self.start("--no-input"))
+        self.assertRegex(self.out, r"confirm: first_sync@[0-9a-f]{12}")
+        self.assertRegex(self.out, r"To do it, run:\npython3 scripts/bootstrap\.py start "
+                                   r"--no-input --confirm first_sync@[0-9a-f]{12}\n")
+
+    def test_guided_without_confirm_exits_2_with_the_tell_it_line(self):
+        self.assertEqual(2, self.start("--guided"))
+        self.assertIn("--guided", self.err)
+        self.assertEqual("Go back to your coding agent and tell it what happened.\n", self.out)
+
+    def test_guided_with_a_wrong_digest_exits_4_with_the_tell_it_line(self):
+        self.assertEqual(4, self.start("--guided", "--confirm", "first_sync@0123456789ab"))
+        self.assertTrue(self.out.endswith(
+            "Go back to your coding agent and tell it what happened.\n"))
+
+    def test_exit_4_when_the_digest_no_longer_matches(self):
+        self.assertEqual(4, self.start("--no-input", "--confirm", "first_sync@0123456789ab"))
+        self.assertIn("the preview changed since you confirmed it", self.err)
+
+    def test_exit_130_when_interrupted(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(bootstrap_steps, "build_report", side_effect=KeyboardInterrupt), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = bootstrap.main(["start", "--no-input"], root=self.root,
+                                  run=test_bootstrap_start.SyncRun(), is_tty=False)
+
+        self.assertEqual(130, code)
+        self.assertIn("Interrupted.", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_no_input_in_a_terminal_behaves_as_without_a_terminal(self):
+        without = self.start("--no-input", tty=False)
+        without_out = self.out
+
+        def no_prompt(text):
+            raise AssertionError(f"prompt called: {text}")
+
+        with_terminal = self.start("--no-input", tty=True, prompt=no_prompt)
+
+        self.assertEqual((3, without_out), (with_terminal, self.out))
+        self.assertEqual(3, without)
+
+    def test_a_terminal_without_no_input_asks(self):
+        asked = []
+        code = self.start(tty=True, prompt=lambda text: asked.append(text) or "n")
+
+        self.assertEqual(1, code)
+        self.assertEqual(["Proceed? [y/N] "], asked)
+
+    def test_agents_saves_and_syncs_the_choice_through_the_runner(self):
+        run = test_bootstrap_start.SyncRun(extra={
+            ("git", "config", "--local", "agent-setup.tools"): "",
+            ("python3", "scripts/agent_setup.py", "sync"): ""})
+
+        code = self.start("--no-input", "--agents", "claude,copilot", run=run)
+
+        self.assertEqual(3, code)
+        self.assertIn(("git", "config", "--local", "agent-setup.tools", "claude,copilot"),
+                      run.calls)
+        self.assertIn(("python3", "scripts/agent_setup.py", "sync"), run.calls)
+        self.assertIn("Coding agents: claude, copilot (saved in git config agent-setup.tools).",
+                      self.out)
+        self.assertIn("Generating the agent files…", self.err)
+
+    def test_agents_with_an_unknown_name_exits_2_and_runs_nothing(self):
+        run = test_bootstrap_start.SyncRun()
+
+        self.assertEqual(2, self.start("--no-input", "--agents", "gemini", run=run))
+        self.assertEqual([], run.calls)
+        self.assertIn("claude, copilot, codex", self.err)
+
+    def test_the_agents_option_is_listed_in_the_help(self):
+        self.assertIn("--agents", bootstrap.build_parser().format_help())
+
+    def test_the_guided_option_is_listed_in_the_help_usage(self):
+        help_text = " ".join(bootstrap.build_parser().format_help().split())
+        self.assertIn("[--issue N] [--guided]]", help_text)
+
+    def test_the_arguments_after_start_reach_the_engine_unchanged(self):
+        argv = ["--no-input", "--confirm", "bootstrap_issue@0123456789ab", "--issue", "7",
+                "--name", "n", "--description", "d", "--owner", "o", "--project-number", "3",
+                "--required-approvals", "1"]
+        runner = test_bootstrap_start.SyncRun(extra={
+            ("git", "remote", "get-url", "origin"): "git@github-work:acme/widgets.git\n",
+            ("git", "remote", "get-url", "--push", "--all", "origin"):
+                "git@github.com:acme/widgets.git\ngit@github.com:other/fork.git\nnot a url\n"})
+        prompt = lambda text: "y"  # noqa: E731
+        with mock.patch.object(bootstrap_start, "main", return_value=0) as engine:
+            code = bootstrap.main(["start", *argv], root=self.root, run=runner, is_tty=False,
+                                  prompt=prompt)
+
+        self.assertEqual(0, code)
+        (passed,), kwargs = engine.call_args
+        self.assertEqual(argv, passed)
+        self.assertEqual(self.root, kwargs["root"])
+        self.assertIs(runner, kwargs["run"])
+        self.assertIs(prompt, kwargs["prompt"])
+        self.assertIs(False, kwargs["is_tty"])
+        self.assertIs(bootstrap.init, kwargs["init"])
+        self.assertIs(bootstrap.validate, kwargs["validate"])
+        self.assertIs(bootstrap.toml_string, kwargs["toml_string"])
+        # the repository default is what `git remote get-url origin` says, parsed like `init` does
+        self.assertEqual(("acme", "widgets"), kwargs["remote_default"]())
+        self.assertIn(("git", "remote", "get-url", "origin"), runner.calls)
+        # `git push` goes to every push URL, so all of them are read and parsed, in order
+        self.assertEqual([("acme", "widgets"), ("other", "fork"), None],
+                         kwargs["push_remote_default"]())
+        self.assertIn(("git", "remote", "get-url", "--push", "--all", "origin"), runner.calls)
+
+    def test_an_unreadable_or_empty_push_url_listing_is_one_unknown_remote(self):
+        def failing(argv, cwd=None):
+            raise bootstrap.CommandError("no origin", returncode=2)
+
+        self.assertEqual([None], bootstrap.push_remote_defaults(self.root, failing))
+        self.assertEqual([None], bootstrap.push_remote_defaults(self.root, lambda a, cwd=None: ""))
+
+    def test_the_real_runner_gets_the_stream_keeping_dry_run_runner(self):
+        with mock.patch.object(bootstrap_start, "main", return_value=0) as engine:
+            bootstrap.main(["start"], root=self.root, is_tty=False)
+            self.assertIs(bootstrap.run_command, engine.call_args.kwargs["run"])
+            self.assertIs(bootstrap_start.run_captured, engine.call_args.kwargs["run_captured"])
+
+            bootstrap.main(["start"], root=self.root, run=test_bootstrap_start.SyncRun(),
+                           is_tty=False)
+            self.assertIsNone(engine.call_args.kwargs["run_captured"])
+
+            injected = object()
+            bootstrap.main(["start"], root=self.root, run=test_bootstrap_start.SyncRun(),
+                           is_tty=False, run_captured=injected)
+            self.assertIs(injected, engine.call_args.kwargs["run_captured"])
+
+    def test_the_dry_runs_stderr_is_shown_when_start_runs_through_bootstrap(self):
+        run = test_bootstrap_start.SyncRun(stderr="warning: ignoring a marker\n")
+
+        code = self.start("--no-input", run=run, run_captured=run.captured)
+
+        self.assertEqual(3, code)
+        self.assertIn("warning: ignoring a marker", self.err)
+        self.assertNotIn("warning: ignoring a marker", self.out)
+
+    def test_an_error_escaping_start_exits_2_not_1(self):
+        for error in (bootstrap.CommandError("boom"), OSError("disk"), ValueError("bad")):
+            with self.subTest(error=error):
+                err = io.StringIO()
+                with mock.patch.object(bootstrap_start, "main", side_effect=error), \
+                        contextlib.redirect_stderr(err):
+                    code = bootstrap.main(["start"], root=self.root, run=FakeRun(), is_tty=False)
+
+                self.assertEqual(2, code)
+                self.assertIn(f"bootstrap start failed: {error}", err.getvalue())
+
+    def test_start_has_no_late_import_of_bootstrap(self):
+        source = Path(bootstrap_start.__file__).read_text()
+
+        self.assertNotRegex(source, r"(?m)^\s+import bootstrap\s*(#.*)?$")
 
 
 if __name__ == "__main__":

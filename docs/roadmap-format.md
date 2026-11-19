@@ -56,5 +56,20 @@ not trigger the status sync. When the entry returns to `planned`, the sync reope
 and removes the label. The pause is refused while a Phase is In progress, In review or Done.
 
 Use the sole roadmap-writing skill, `roadmap-write`, to create or amend this
-file. Preserve historical entries and notes; do not reclassify progress or
+file. It can draft a first version on request, and the roadmap can be amended at
+any time. Preserve historical entries and notes; do not reclassify progress or
 rewrite the ledger as a side effect of another workflow.
+
+## Hooks and dependency checks
+
+The main session owns exactly three roadmap hooks in `.specify/extensions.yml`:
+
+- `roadmap-entry.check` (mandatory, before specifying): the entry must be `planned` and `SPECIFY_FEATURE_DIRECTORY=specs/<ID>-<slug>` must name its directory. It warns about dependency blockers but does not acknowledge them.
+- `roadmap-dependency.check` (mandatory, before implementing): rechecks live GitHub completion and blocks unless the user explicitly acknowledges the exact blocker set.
+- `roadmap.write` (optional, after a constitution change).
+
+Run the applicable hooks once per feature or phase, never per `tdd-implementer` slice. The main session runs the dependency guard before delegating roadmap work and gives `tdd-implementer` the entry, the requested scope, any verified milestone evidence, the blockers, and any explicit acknowledgement (or confirms there are no blockers). The agent stops if this result is missing; it does not invent or broaden an override.
+
+`ROADMAP.md` uses plan statuses only: `undecided`, `needs-info`, `planned`, `deferred`, `abandoned`. Read progress with `python3 scripts/roadmap_status.py` or on the board; use `python3 scripts/roadmap_status.py --id <ID> --json` for dependency checks. Only an Epic closed as completed satisfies ordinary completion; missing Epics, open Epics and closure as not planned do not. Historical notes and board Status are not completion evidence.
+
+The `prerequisites-acknowledged` label (human-only, see `AGENTS.md`) applies only to the known blockers reported for that Phase PR and never overrides invalid data or ambiguous identity.

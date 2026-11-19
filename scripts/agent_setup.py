@@ -732,7 +732,15 @@ def run_sync(root, tools=None):
 
 # Menu order of `setup`; the number a developer types is the position here.
 MENU = (("copilot", "GitHub Copilot"), ("claude", "Claude Code"), ("codex", "Codex"))
-ALL_TOOLS_HINT = "Generated sub-agents for all tools; run npm run setup-agents to choose yours."
+ALL_TOOLS_HINT = (
+    "Generated sub-agents for all tools (Claude Code, GitHub Copilot, Codex). "
+    "Optional: run npm run setup-agents to keep only the ones you use; "
+    "run it again whenever you change coding agents."
+)
+RERUN_HINT = (
+    "Run npm run setup-agents again whenever you change coding agents, "
+    "to generate the files for the new ones."
+)
 
 
 def parse_choice(answer):
@@ -748,16 +756,13 @@ def parse_choice(answer):
     return [tool for tool in TOOLS if tool in chosen] or None
 
 
-def run_setup(root, ask=input, isatty=sys.stdin.isatty):
-    """Ask which tools the developer uses, save it in Git config and sync those tools."""
-    if not isatty():
-        print(
-            "::error::setup is interactive and needs a terminal. Run "
-            "`git config agent-setup.tools <tools>` (comma-separated: "
-            f"{', '.join(TOOLS)}) and then `python3 scripts/agent_setup.py sync` instead."
-        )
-        return 1
-    current = [name for name in TOOLS if name in configured_names(root)]
+def ask_tools(ask, current=()):
+    """Show the menu and return the chosen tools in TOOLS order, or None when cancelled.
+
+    `current` is the saved choice: Enter keeps it, and all tools when it is empty. The caller
+    checks for a terminal; this only calls `ask`.
+    """
+    current = [name for name in TOOLS if name in current]
     default = current or list(TOOLS)
     print("Which coding agents do you use? (comma-separated numbers)")
     for number, (_, label) in enumerate(MENU, start=1):
@@ -768,22 +773,46 @@ def run_setup(root, ask=input, isatty=sys.stdin.isatty):
             answer = ask("Choice [Enter keeps current]: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nCancelled; nothing changed.")
-            return 1
+            return None
         chosen = default if not answer else parse_choice(answer)
         if chosen:
-            break
+            return chosen
         print("Enter numbers 1-3 or tool names (copilot, claude, codex), separated by commas.")
-    value = ",".join(chosen)
+
+
+def save_tools(root, tools):
+    """Save the tools in Git config agent-setup.tools; print the error and return False on failure."""
     result = subprocess.run(
-        ["git", "-C", str(root), "config", "--local", "agent-setup.tools", value],
+        ["git", "-C", str(root), "config", "--local", "agent-setup.tools", ",".join(tools)],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         print(f"::error::could not save the choice: {result.stderr.strip()}")
+        return False
+    return True
+
+
+def run_setup(root, ask=input, isatty=sys.stdin.isatty):
+    """Ask which tools the developer uses, save it in Git config and sync those tools."""
+    if not isatty():
+        print(
+            "::error::setup is interactive and needs a terminal. Run "
+            "`git config agent-setup.tools <tools>` (comma-separated: "
+            f"{', '.join(TOOLS)}) and then `python3 scripts/agent_setup.py sync` instead."
+        )
         return 1
-    print(f"Saved: git config agent-setup.tools {value}")
-    return run_sync(root, chosen)
+    current = [name for name in TOOLS if name in configured_names(root)]
+    chosen = ask_tools(ask, current)
+    if chosen is None:
+        return 1
+    if not save_tools(root, chosen):
+        return 1
+    print(f"Saved: git config agent-setup.tools {','.join(chosen)}")
+    code = run_sync(root, chosen)
+    if code == 0:
+        print(RERUN_HINT)
+    return code
 
 
 def main():

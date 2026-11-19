@@ -24,7 +24,7 @@ Run these steps once per clone, in the repository root, before your first commit
    npm run setup-agents
    ```
 
-   It asks which agents you use, saves the answer in your local Git config and regenerates only those tools' files. Run it again to change your choice.
+   It asks which agents you use, saves the answer in your local Git config and regenerates only those tools' files. Run it again whenever you change coding agents, to generate the files for the new ones. `python3 scripts/bootstrap.py start` asks the same question once when no choice is saved (`start --agents <tool>,…` answers it without asking).
 
 Git does not regenerate the files when you switch branches, because checking out a branch must not run its code. Run `python3 scripts/agent_setup.py sync` after switching branches or pulling changes to `agent-definitions/` (`npm run setup-agents` is the interactive way to change which tools you use; `python3 scripts/bootstrap.py` reports out-of-date agent files). Restart your coding agent session to load new or changed sub-agents.
 
@@ -210,6 +210,18 @@ Steps:
 11. **Implement from `tasks.md`** on branches linked to the corresponding Phase issues. Update task checkboxes as work changes; each Phase issue tracks a whole Phase, not individual `T###` tasks. Follow the task and phase guidance in [`AGENTS.md`](AGENTS.md). Before implementation, run the mandatory dependency guard; then run `code-review-and-quality` after implementation. Do not write progress statuses back to the roadmap.
 
 See the [end-to-end walkthrough](scripts/README.md#roadmap-item-walkthrough) for commands and failed-sync recovery.
+
+### What to read
+
+A feature directory (`specs/<id>-<slug>/`) holds several kinds of file, and each role needs only some of them. The example paths are from `specs/001-guided-bootstrap/`. The reading times are rough estimates.
+
+| Role                   | Read                                                                                                                                                                                                                                                                                                                                 | Skip unless needed                                                                                                                                                                       | Rough time             |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| Stakeholder            | `spec.md`: User Scenarios & Testing (the user stories and their priorities) and Success Criteria                                                                                                                                                                                                                                     | Everything else                                                                                                                                                                          | About 15 minutes       |
+| Spec-and-plan reviewer | `spec.md`: Clarifications, User Scenarios & Testing, Requirements; `plan.md`: Summary, Technical Context, Phase split (when present), revision notes (when present), Complexity Tracking and Constitution Check                                                                                                                      | `research.md`, `data-model.md`, `contracts/`, `quickstart.md`, and `plan.md`'s Project Structure (apart from Phase split and revision notes), unless a reviewed decision depends on them | About 30 to 45 minutes |
+| Phase implementer      | The Phase's section in `tasks.md`; `plan.md`: Phase split (when present), Technical Context and Project Structure; `spec.md`: the user stories and requirements the Phase's tasks reference; `contracts/` and `data-model.md` for the tasks that touch them; the `research.md` decisions (D1, D2, ...) that the plan or a task cites | The rest of the spec and plan                                                                                                                                                            | Depends on the Phase   |
+
+`tasks.md` exists only after the spec-and-plan PR merges, when the Phase 1 implementation branch generates it. The spec-and-plan reviewer reads the spec and plan in that PR; the implementer reads them again only for the parts their tasks touch.
 
 ### Creating Phase issues from tasks
 
