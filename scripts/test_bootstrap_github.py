@@ -29,6 +29,44 @@ required_approvals = {approvals}
 """
 
 
+# Recorded by the T001 pilot on a fresh user-owned board: every built-in workflow starts enabled.
+PILOT_WORKFLOWS = (
+    "Auto-add sub-issues to project", "Auto-close issue", "Item added to project",
+    "Item closed", "Pull request linked to issue", "Pull request merged",
+)
+
+
+def rest_methods(argv):
+    """Every HTTP method a `gh api` argv names, in any spelling (-X, -XPOST, --method[=])."""
+    methods = []
+    for index, arg in enumerate(argv):
+        if arg in ("-X", "--method"):
+            methods.append(argv[index + 1] if index + 1 < len(argv) else "")
+        elif arg.startswith("--method="):
+            methods.append(arg[len("--method="):])
+        elif arg.startswith("-X"):
+            methods.append(arg[2:])
+    return methods
+
+
+def has_input(argv):
+    """True when a `gh api` argv sends a body file (--input f or --input=f)."""
+    return any(arg == "--input" or arg.startswith("--input=") for arg in argv)
+
+
+def has_field(argv):
+    """True when a `gh api` argv sends fields (-f/-F, attached -fa=b, --field[=], --raw-field[=])."""
+    return any(arg in ("-f", "-F", "--field", "--raw-field")
+               or arg.startswith(("--field=", "--raw-field="))
+               or (arg[:2] in ("-f", "-F") and not arg.startswith("--"))
+               for arg in argv)
+
+
+def is_mutation(body):
+    """True for a GraphQL body with a mutation; an unreadable body counts as one."""
+    return not isinstance(body, dict) or "mutation" in str(body.get("query", ""))
+
+
 class FakeGitHub:
     """Stands in for gh: keeps repository state, records every call, applies writes to the state."""
 
@@ -52,6 +90,10 @@ class FakeGitHub:
         self.fail_mutation = None
         self.cwds = {}
         self.next_option = 0
+        self.workflows = [{"name": name, "enabled": True} for name in PILOT_WORKFLOWS]
+        self.workflow_error = None
+        self.workflow_raw = None
+        self.workflow_requests = []
         self.board = None
         if board:
             options = status_options
@@ -91,8 +133,15 @@ class FakeGitHub:
         if argv[:3] in (["gh", "label", "create"], ["gh", "label", "edit"]):
             return True
         if argv[:3] == ["gh", "api", "graphql"]:
-            return "mutation" in body["query"]
-        return "-X" in argv
+            return is_mutation(body)
+        if argv[:2] != ["gh", "api"]:
+            return False
+        if has_input(argv):
+            return True  # a REST body makes the call a POST without -X
+        methods = rest_methods(argv)
+        if any(method.upper() != "GET" for method in methods):
+            return True
+        return has_field(argv) and not methods  # fields make gh api a POST unless GET is explicit
 
     def __call__(self, argv, cwd=None):
         argv = list(argv)
@@ -156,6 +205,18 @@ class FakeGitHub:
         if "linkProjectV2ToRepository" in query:
             self.board["repositories"].append({"nameWithOwner": REPO})
             return "{}"
+        if "workflows(" in query:
+            self.workflow_requests.append((query, variables))
+            if self.workflow_error:
+                raise bootstrap.CommandError(self.workflow_error)
+            if self.workflow_raw is not None:
+                return self.workflow_raw
+            # the query's `... on ProjectV2Owner` fragment matches only users and organizations
+            if (variables["login"] != "acme" or self.board is None
+                    or self.owner_type not in ("User", "Organization")):
+                return json.dumps({"data": {"repositoryOwner": {}}})
+            return json.dumps({"data": {"repositoryOwner": {"projectV2": {
+                "workflows": {"nodes": self.workflows}}}}})
         if "repository(owner" in query:
             return json.dumps({"data": {"repository": {"id": "R_1"}}})
         if variables["login"] != "acme":
@@ -244,6 +305,66 @@ class GitHubTestCase(unittest.TestCase):
         return next(r for r in self.managed(run)["rules"] if r["type"] == kind)
 
 
+class IsWriteTest(unittest.TestCase):
+    """FakeGitHub.is_write must see every REST write spelling, or `writes` under-reports."""
+
+    def test_rest_writes_are_writes(self):
+        for argv in (
+            ["gh", "api", "repos/o/r/rulesets", "--input", "f.json"],
+            ["gh", "api", "repos/o/r/rulesets", "-X", "POST"],
+            ["gh", "api", "repos/o/r/rulesets", "-XPOST"],
+            ["gh", "api", "repos/o/r/rulesets", "--method", "PUT"],
+            ["gh", "api", "repos/o/r/rulesets", "--method=DELETE"],
+            ["gh", "api", "repos/o/r/rulesets", "--input=f.json"],
+            ["gh", "api", "repos/o/r/rulesets", "-f", "a=b"],
+            ["gh", "api", "repos/o/r/rulesets", "-F", "a=b"],
+            ["gh", "api", "repos/o/r/rulesets", "-fa=b"],
+            ["gh", "api", "repos/o/r/rulesets", "-Fa=b"],
+            ["gh", "api", "repos/o/r/rulesets", "--field", "a=b"],
+            ["gh", "api", "repos/o/r/rulesets", "--field=a=b"],
+            ["gh", "api", "repos/o/r/rulesets", "--raw-field", "a=b"],
+            ["gh", "api", "repos/o/r/rulesets", "--raw-field=a=b"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(FakeGitHub.is_write(argv, None))
+
+    def test_an_explicit_get_keeps_fields_as_query_parameters(self):
+        for argv in (
+            ["gh", "api", "repos/o/r/rulesets", "-X", "GET", "-f", "a=b"],
+            ["gh", "api", "repos/o/r/rulesets", "--method=GET", "--field=a=b"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertFalse(FakeGitHub.is_write(argv, None))
+
+    def test_rest_methods_reads_every_spelling(self):
+        for argv, methods in (
+            (["gh", "api", "x"], []),
+            (["gh", "api", "x", "-X", "POST"], ["POST"]),
+            (["gh", "api", "x", "-XPUT"], ["PUT"]),
+            (["gh", "api", "x", "--method", "delete"], ["delete"]),
+            (["gh", "api", "x", "--method=PATCH"], ["PATCH"]),
+            (["gh", "api", "x", "-X"], [""]),
+            (["gh", "api", "x", "-X", "GET", "--method=POST"], ["GET", "POST"]),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(methods, rest_methods(argv))
+
+    def test_reads_are_not_writes(self):
+        for argv in (
+            ["gh", "api", "repos/o/r/rulesets"],
+            ["gh", "api", "repos/o/r/rulesets", "-X", "GET"],
+            ["gh", "api", "repos/o/r/rulesets", "-XGET"],
+            ["gh", "api", "repos/o/r/rulesets", "--method=GET"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertFalse(FakeGitHub.is_write(argv, None))
+
+    def test_graphql_query_is_a_read_and_mutation_a_write(self):
+        argv = ["gh", "api", "graphql", "--input", "f.json"]
+        self.assertFalse(FakeGitHub.is_write(argv, {"query": "query { viewer { id } }"}))
+        self.assertTrue(FakeGitHub.is_write(argv, {"query": "mutation { x }"}))
+
+
 class ModesTest(GitHubTestCase):
     def test_preview_lists_every_change_by_area_and_writes_nothing(self):
         run = FakeGitHub()
@@ -325,6 +446,32 @@ class ModesTest(GitHubTestCase):
     def test_apply_and_check_are_mutually_exclusive(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             self.github(FakeGitHub(), "--apply", "--check")
+
+
+class PlanSettingsTest(GitHubTestCase):
+    def context(self):
+        return bootstrap_github.project_context.load_context(self.root / "project-context.toml")
+
+    def test_it_composes_every_area_and_returns_the_board_url(self):
+        plan, url = bootstrap_github.plan_settings(REPO, self.context(), FakeGitHub())
+
+        self.assertEqual("https://github.com/orgs/acme/projects/3", url)
+        self.assertEqual({"Labels", "Board", "Ruleset"}, {area for area, _ in plan.lines})
+
+    def test_a_board_owner_other_than_the_repository_owner_is_refused_before_any_call(self):
+        run = FakeGitHub()
+
+        with self.assertRaisesRegex(ValueError, "github_project.owner must match"):
+            bootstrap_github.plan_settings("other/widgets", self.context(), run)
+
+        self.assertEqual([], run.calls)
+
+    def test_it_only_reads(self):
+        run = FakeGitHub()
+
+        bootstrap_github.plan_settings(REPO, self.context(), run)
+
+        self.assertEqual([], run.writes)
 
 
 class LabelsTest(GitHubTestCase):
@@ -447,11 +594,36 @@ class BoardTest(GitHubTestCase):
             self.assertEqual(code, 0, owner_type)
             self.assertIn("Board: add Status option Planned", out)
 
-    def test_manual_workflow_step_is_printed_with_the_board_url(self):
-        _, out, _ = self.github(FakeGitHub())
-        self.assertIn("Manual step", out)
-        self.assertIn("https://github.com/orgs/acme/projects/3", out)
-        self.assertIn("In review", out)
+    MANUAL = (
+        "Manual step (the API cannot read or set it): in "
+        "https://github.com/orgs/acme/projects/3 open Workflows and check that "
+        '"Pull request linked to issue" is enabled with Status = In review; '
+        "set it if not.")
+
+    def test_manual_workflow_step_is_printed_with_the_board_url_after_apply(self):
+        code, out, _ = self.github(FakeGitHub(), "--apply")
+        self.assertEqual(code, 0)
+        self.assertIn(self.MANUAL, out)
+        self.assertGreater(out.index(self.MANUAL), out.index("Applied "))
+
+    def test_a_preview_with_changes_has_no_manual_step(self):
+        code, out, _ = self.github(FakeGitHub())
+        self.assertEqual(code, 0)
+        self.assertIn("Labels: create", out)
+        self.assertNotIn("Manual step", out)
+
+    def test_a_preview_with_nothing_to_change_has_the_manual_step(self):
+        run = FakeGitHub()
+        self.github(run, "--apply")
+        code, out, _ = self.github(run)
+        self.assertEqual(code, 0)
+        self.assertIn("Nothing to change", out)
+        self.assertIn(self.MANUAL, out)
+
+    def test_check_with_drift_still_exits_one_and_has_the_manual_step(self):
+        code, out, _ = self.github(FakeGitHub(), "--check")
+        self.assertEqual(code, 1)
+        self.assertIn(self.MANUAL, out)
 
     def test_manual_step_is_not_drift(self):
         run = FakeGitHub()
@@ -892,6 +1064,125 @@ class CredentialsTest(GitHubTestCase):
         _, out, _ = self.github(run)
         self.assertEqual(out.count("organization-level secrets and variables were not checked"), 1)
 
+    def secret_names(self, secrets=(), org_secrets=(), org_error=False, error=None):
+        run = FakeGitHub()
+        run.secrets = list(secrets)
+        run.org_secrets = list(org_secrets)
+        run.org_error = org_error
+        if error:
+            original = run.__call__
+
+            def failing(argv, cwd=None):
+                if list(argv)[:3] == ["gh", "secret", "list"]:
+                    raise bootstrap.CommandError(error)
+                return original(argv, cwd=cwd)
+            return bootstrap_github.read_credential_secrets(REPO, failing)
+        return bootstrap_github.read_credential_secrets(REPO, run)
+
+    def test_the_structured_variant_returns_only_the_toolkit_secret_names(self):
+        found = self.secret_names(["PROJECT_BOARD_TOKEN", "UNRELATED"],
+                                  ["PROJECT_STATUS_APP_ID"])
+
+        self.assertEqual({"PROJECT_BOARD_TOKEN", "PROJECT_STATUS_APP_ID"}, set(found.names))
+        self.assertIsNone(found.error)
+        self.assertTrue(found.organization_checked)
+
+    def test_the_structured_variant_says_when_organization_secrets_were_not_read(self):
+        found = self.secret_names(["PROJECT_BOARD_TOKEN"], org_error=True)
+
+        self.assertEqual(["PROJECT_BOARD_TOKEN"], list(found.names))
+        self.assertFalse(found.organization_checked)
+
+    def test_the_structured_variant_carries_an_unreadable_error(self):
+        found = self.secret_names(error="HTTP 403: forbidden")
+
+        self.assertEqual("HTTP 403: forbidden", found.error)
+        self.assertEqual((), tuple(found.names))
+
+    def test_an_unexpected_secret_list_shape_is_an_unreadable_error(self):
+        for reply in ('[{"label": "X"}]', "[1]"):
+            with self.subTest(reply=reply):
+                found = bootstrap_github.read_credential_secrets(REPO, lambda argv, cwd=None: reply)
+
+                self.assertIsNotNone(found.error)
+                self.assertEqual((), tuple(found.names))
+
+    def test_a_malformed_secret_list_has_a_fixed_error_message(self):
+        found = bootstrap_github.read_credential_secrets(
+            REPO, lambda argv, cwd=None: '[{"label": "X"}]')
+
+        self.assertEqual("the secret list could not be read", found.error)
+
+    def test_a_malformed_organization_reply_is_unreadable_not_an_exception(self):
+        replies = ("[]", '{"secrets": [1]}', '{"secrets": [{"label": "x"}]}', '{"secrets": 5}')
+        for reply in replies:
+            with self.subTest(reply=reply):
+                def run(argv, cwd=None, reply=reply):
+                    if "organization-secrets?per_page=100" in " ".join(argv):
+                        return reply
+                    return "[]"
+                self.assertIsNone(bootstrap_github.organization_names(REPO, "secrets", run))
+                found = bootstrap_github.read_credential_secrets(REPO, run)
+                self.assertFalse(found.organization_checked)
+
+    def test_a_malformed_variable_list_is_a_warning_not_an_exception(self):
+        for reply in ('{"name": "X"}', "[1]", '[{"label": "X"}]'):
+            with self.subTest(reply=reply):
+                def run(argv, cwd=None, reply=reply):
+                    return reply if list(argv)[:3] == ["gh", "variable", "list"] else "[]"
+                out = bootstrap_github.report_credentials(REPO, run)
+                self.assertTrue(any(line.startswith("Warning: cannot read variable names")
+                                    for line in out), out)
+
+    def test_an_unreadable_secret_list_says_organization_secrets_were_not_checked(self):
+        found = self.secret_names(error="HTTP 403: forbidden")
+
+        self.assertFalse(found.organization_checked)
+
+    def lines(self, secrets=(), variables=(), org_error=False, error=None):
+        run = FakeGitHub()
+        run.secrets = list(secrets)
+        run.variables = list(variables)
+        run.org_error = org_error
+        if error:
+            original = run.__call__
+
+            def failing(argv, cwd=None):
+                if list(argv)[:3] == ["gh", "secret", "list"]:
+                    raise bootstrap.CommandError(error)
+                return original(argv, cwd=cwd)
+            return bootstrap_github.report_credentials(REPO, failing)
+        return bootstrap_github.report_credentials(REPO, run)
+
+    def test_the_human_lines_for_each_credential_state_are_pinned(self):
+        guide = "docs/bootstrap.md#board-credentials"
+        not_checked = ("Note: organization-level secrets and variables were not checked "
+                       "(not readable, or the repository is not in an organization)")
+        auto = "PHASE_SYNC_AUTO_APPLY: not set (information only)"
+        cases = {
+            "token": (dict(secrets=["PROJECT_BOARD_TOKEN"]),
+                      ["Board credential: PROJECT_BOARD_TOKEN configured", auto]),
+            "app": (dict(secrets=["PROJECT_STATUS_APP_ID", "PROJECT_BOARD_APP_PRIVATE_KEY"]),
+                    ["Board credential: GitHub App configured", auto]),
+            "half app": (dict(secrets=["PROJECT_STATUS_APP_ID"]),
+                         [f"Board credential: not configured; board sync is skipped until it is "
+                          f"(see {guide})",
+                          "Warning: only PROJECT_STATUS_APP_ID is set; the GitHub App needs both "
+                          f"PROJECT_STATUS_APP_ID and PROJECT_BOARD_APP_PRIVATE_KEY (see {guide})",
+                          auto]),
+            "none": (dict(), [f"Board credential: not configured; board sync is skipped until "
+                              f"it is (see {guide})", auto]),
+            "organization unreadable": (dict(secrets=["PROJECT_BOARD_TOKEN"], org_error=True),
+                                        [not_checked,
+                                         "Board credential: PROJECT_BOARD_TOKEN configured",
+                                         auto]),
+            "unreadable": (dict(error="HTTP 403: forbidden"),
+                           ["Warning: cannot read secret names (HTTP 403: forbidden)", auto]),
+        }
+        for name, (kwargs, expected) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(expected, self.lines(**kwargs))
+
     def test_nothing_configured_points_to_the_guide(self):
         _, _, out, _ = self.report([])
         self.assertIn("Board credential: not configured", out)
@@ -921,6 +1212,63 @@ if __name__ == "__main__":
 
 SCRIPTS = Path(__file__).resolve().parent
 WORKFLOWS = SCRIPTS.parent / ".github" / "workflows"
+
+
+class BoardWorkflowsTest(unittest.TestCase):
+    LINKED = "Pull request linked to issue"
+    SUB_ISSUES = "Auto-add sub-issues to project"
+
+    def load(self, run):
+        return bootstrap_github.load_board_workflows(run, "acme", 3)
+
+    def test_reports_both_target_workflows_enabled(self):
+        self.assertEqual(self.load(FakeGitHub()), {self.LINKED: True, self.SUB_ISSUES: True})
+
+    def test_reports_a_disabled_workflow_as_false(self):
+        run = FakeGitHub()
+        for workflow in run.workflows:
+            if workflow["name"] == self.LINKED:
+                workflow["enabled"] = False
+        self.assertEqual(self.load(run), {self.LINKED: False, self.SUB_ISSUES: True})
+
+    def test_reports_a_missing_workflow_as_none_and_ignores_others(self):
+        run = FakeGitHub()
+        run.workflows = [w for w in run.workflows if w["name"] != self.SUB_ISSUES]
+        self.assertEqual(self.load(run), {self.LINKED: True, self.SUB_ISSUES: None})
+
+    def test_query_error_gives_all_none(self):
+        run = FakeGitHub()
+        run.workflow_error = "Your token has not been granted the required scopes"
+        self.assertEqual(self.load(run), {self.LINKED: None, self.SUB_ISSUES: None})
+
+    def test_bad_json_gives_all_none(self):
+        run = FakeGitHub()
+        run.workflow_raw = "not json"
+        self.assertEqual(self.load(run), {self.LINKED: None, self.SUB_ISSUES: None})
+
+    def test_null_project_gives_all_none(self):
+        self.assertEqual(self.load(FakeGitHub(board=False)),
+                         {self.LINKED: None, self.SUB_ISSUES: None})
+
+    def test_user_owner_resolves_like_load_board(self):
+        run = FakeGitHub(owner_type="User")
+        self.assertEqual(self.load(run), {self.LINKED: True, self.SUB_ISSUES: True})
+        [(query, variables)] = run.workflow_requests
+        self.assertIn("workflows(", query)
+        self.assertEqual(variables, {"login": "acme", "number": 3})
+
+    def test_owner_that_is_neither_user_nor_organization_gives_all_none(self):
+        run = FakeGitHub(owner_type="Bot")
+        self.assertEqual(self.load(run), {self.LINKED: None, self.SUB_ISSUES: None})
+
+    def test_node_with_enabled_none_gives_none_for_that_name(self):
+        run = FakeGitHub()
+        run.workflows = [{"name": self.LINKED, "enabled": None},
+                         {"name": self.SUB_ISSUES, "enabled": True}]
+        self.assertEqual(self.load(run), {self.LINKED: None, self.SUB_ISSUES: True})
+
+    def test_board_query_does_not_read_workflows(self):
+        self.assertNotIn("workflows", bootstrap_github.BOARD_QUERY)
 
 
 class ConstantsTest(unittest.TestCase):

@@ -8,6 +8,21 @@ from pathlib import Path
 import re
 import sys
 import tomllib
+import unicodedata
+
+
+def mask_url_credentials(url):
+    """`url` with the userinfo of a `scheme://` URL (everything before the last `@` of the
+    authority) replaced by `***`, so a token embedded in a remote never reaches a message, title
+    or command. scp-style `git@host:path` has no scheme and stays as it is. Only for display:
+    never pass the result to a real command. The one implementation, shared by the sync and the
+    bootstrap steps."""
+    scheme, separator, rest = url.partition("://")
+    if not separator or not scheme or not scheme.replace("+", "").replace("-", "").isalnum():
+        return url
+    authority, slash, path = rest.partition("/")
+    userinfo, at, host = authority.rpartition("@")
+    return f"{scheme}://***@{host}{slash}{path}" if at else url
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,6 +49,15 @@ MISSING_REVIEW_MESSAGE = (
     "(0 for a solo project)"
 )
 OWNER_PATTERN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
+# Control characters (C0, DEL, C1) and line/paragraph separators: shells and terminals do not
+# reproduce them from a quoted command, so project.name and project.description may not hold them.
+SINGLE_LINE_FORBIDDEN = frozenset({"Cc", "Zl", "Zp"})
+# Bidi embedding, override and isolate controls (category Cf, so listed by code point): they can
+# make a preview read differently from what runs. ZWJ (U+200D) and soft hyphen stay valid.
+SINGLE_LINE_BIDI = frozenset(
+    chr(code) for code in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
+)
+SINGLE_LINE_MESSAGE = "must be a non-empty single-line string without control characters"
 
 
 BOOTSTRAP_MARKERS = (
@@ -105,8 +129,12 @@ def board_owner_or_skip(config, root, repository_owner, environ):
 
 
 def load_context(path):
-    with path.open("rb") as file:
-        context = tomllib.load(file)
+    return parse_context(path.read_bytes().decode("utf-8"))
+
+
+def parse_context(text):
+    """Validate project-context.toml text; the one validation shared with the bootstrap scripts."""
+    context = tomllib.loads(text)
     unknown_sections = set(context) - set(SCHEMA)
     missing_sections = set(SCHEMA) - set(context)
     if missing_sections == {"review"} and not unknown_sections:
@@ -133,8 +161,11 @@ def load_context(path):
             raise ValueError(f"missing {section}.{', '.join(sorted(missing))}{hint}")
     for key in ("name", "description"):
         value = context["project"][key]
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"project.{key} must be a non-empty string")
+        if not isinstance(value, str) or not value.strip() or any(
+            unicodedata.category(char) in SINGLE_LINE_FORBIDDEN or char in SINGLE_LINE_BIDI
+            for char in value
+        ):
+            raise ValueError(f"project.{key} {SINGLE_LINE_MESSAGE}")
     owner = context["github_project"]["owner"]
     if not isinstance(owner, str) or len(owner) > 39 or not OWNER_PATTERN.fullmatch(owner):
         raise ValueError("github_project.owner must be a GitHub owner login")

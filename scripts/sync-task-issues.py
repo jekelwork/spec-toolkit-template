@@ -81,6 +81,11 @@ def gh(*args, check=True, env=None):
     return result
 
 
+# Also used by bootstrap_start.py, which must read the origin the way this script does.
+# A trailing slash is allowed: `https://github.com/acme/widgets/` names acme/widgets.
+ORIGIN_URL = re.compile(r"(?:https://github\.com/|git@github\.com:)([^/]+)/(.+?)(?:\.git)?/?$")
+
+
 def origin_repo():
     url = subprocess.run(
         ["git", "config", "--get", "remote.origin.url"],
@@ -89,9 +94,9 @@ def origin_repo():
         text=True,
         check=True,
     ).stdout.strip()
-    match = re.match(r"(?:https://github\.com/|git@github\.com:)([^/]+)/(.+?)(?:\.git)?$", url)
+    match = ORIGIN_URL.match(url)
     if not match:
-        sys.exit(f"Remote is not a GitHub URL: {url!r}")
+        sys.exit(f"Remote is not a GitHub URL: {project_context.mask_url_credentials(url)!r}")
     return match.group(1), match.group(2)
 
 

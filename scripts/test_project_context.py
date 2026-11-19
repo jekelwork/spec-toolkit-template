@@ -52,6 +52,52 @@ class ProjectContextTest(unittest.TestCase):
             },
         )
 
+    def parse_with(self, key, value):
+        import project_context
+
+        text = VALID.replace(f'{key} = "{"Example" if key == "name" else "An example project"}"',
+                             f"{key} = {json.dumps(value)}")
+        return project_context.parse_context(text)
+
+    def test_name_and_description_reject_control_and_line_separator_characters(self):
+        for key in ("name", "description"):
+            for label, char in (("newline", "\n"), ("tab", "\t"), ("escape", "\x1b"),
+                                ("DEL", "\x7f"), ("C1 NEL", "\x85"),
+                                ("line separator", "\u2028"), ("paragraph separator", "\u2029")):
+                with self.subTest(key=key, character=label):
+                    with self.assertRaises(ValueError) as raised:
+                        self.parse_with(key, f"a{char}b")
+                    self.assertEqual(
+                        f"project.{key} must be a non-empty single-line string "
+                        "without control characters", str(raised.exception))
+
+    def test_name_and_description_reject_bidi_controls(self):
+        for key in ("name", "description"):
+            for char in ("\U0000202a", "\U0000202e", "\U00002066", "\U00002069"):
+                with self.subTest(key=key, character=f"U+{ord(char):04X}"):
+                    with self.assertRaises(ValueError) as raised:
+                        self.parse_with(key, f"a{char}b")
+                    self.assertEqual(
+                        f"project.{key} must be a non-empty single-line string "
+                        "without control characters", str(raised.exception))
+
+    def test_name_and_description_keep_zero_width_joiner_and_soft_hyphen(self):
+        for key in ("name", "description"):
+            for text in ("\U0001f468\U0000200d\U0001f469", "co\U000000adoperate"):
+                with self.subTest(key=key, text=text):
+                    import project_context
+
+                    default = {"name": "Example", "description": "An example project"}[key]
+                    parsed = project_context.parse_context(
+                        VALID.replace(f'{key} = "{default}"', f'{key} = "{text}"'))
+                    self.assertEqual(text, parsed["project"][key])
+
+    def test_name_and_description_keep_ordinary_non_ascii_text(self):
+        text = "Käyttäjä — ü 日本"
+        for key in ("name", "description"):
+            with self.subTest(key=key):
+                self.assertEqual(text, self.parse_with(key, text)["project"][key])
+
     def test_missing_and_invalid_values_fail_explicitly(self):
         for invalid, expected in (
             (VALID.replace('name = "Example"\n', ""), "project.name"),
@@ -421,6 +467,63 @@ class BoardOwnerOrSkipTest(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 2)
+
+
+class ParseContextTest(unittest.TestCase):
+    def setUp(self):
+        import project_context
+
+        self.module = project_context
+
+    def test_valid_text_returns_the_context(self):
+        self.assertEqual(
+            self.module.parse_context(VALID),
+            {
+                "project": {"name": "Example", "description": "An example project"},
+                "github_project": {"owner": "example-org", "number": 123},
+                "review": {"required_approvals": 1},
+            },
+        )
+
+    def test_missing_review_uses_the_missing_review_message(self):
+        with self.assertRaises(ValueError) as raised:
+            self.module.parse_context(NO_REVIEW)
+        self.assertEqual(str(raised.exception), self.module.MISSING_REVIEW_MESSAGE)
+
+    def test_invalid_values_raise_value_error(self):
+        for invalid, expected in (
+            (VALID.replace("number = 123", "number = 0"), "github_project.number"),
+            (VALID.replace("required_approvals = 1", "required_approvals = -1"), "required_approvals"),
+            (VALID + "\n[extra]\nx = 1\n", "unknown sections: extra"),
+        ):
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.module.parse_context(invalid)
+
+    def test_invalid_toml_raises_decode_error(self):
+        import tomllib
+
+        with self.assertRaises(tomllib.TOMLDecodeError):
+            self.module.parse_context("not = [valid")
+
+    def test_load_context_matches_parse_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "context.toml"
+            path.write_text(VALID, encoding="utf-8")
+            self.assertEqual(self.module.load_context(path), self.module.parse_context(VALID))
+            path.write_text(NO_REVIEW, encoding="utf-8")
+            with self.assertRaises(ValueError) as raised:
+                self.module.load_context(path)
+            self.assertEqual(str(raised.exception), self.module.MISSING_REVIEW_MESSAGE)
+
+    def test_load_context_rejects_a_bare_carriage_return_between_keys(self):
+        import tomllib
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "context.toml"
+            path.write_bytes(b"a = 1\rb = 2\n")
+            with self.assertRaises(tomllib.TOMLDecodeError):
+                self.module.load_context(path)
 
 
 if __name__ == "__main__":

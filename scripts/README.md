@@ -4,15 +4,20 @@
 
 One entry point for setting up a repository created from the template; see
 [`docs/bootstrap.md`](../docs/bootstrap.md). `check` (also what a plain
-`bootstrap.py` runs), `init` and `github`:
+`bootstrap.py` runs), `init`, `github` and `start`:
 
 ```bash
 python3 scripts/bootstrap.py                   # same as: check
+python3 scripts/bootstrap.py check --json      # the machine-readable report
+python3 scripts/bootstrap.py start             # guided: preview and confirm each step
+python3 scripts/bootstrap.py start --no-input  # never prompt; exit 3 with a preview to confirm
+python3 scripts/bootstrap.py start --no-input --agents claude,copilot,codex  # save the coding agents you use
+python3 scripts/bootstrap.py start --no-input --confirm <step-id>@<digest> [--guided]
 python3 scripts/bootstrap.py init --description "What it does" --create-board
 python3 scripts/bootstrap.py github            # preview
 python3 scripts/bootstrap.py github --apply    # make the changes
 python3 scripts/bootstrap.py github --check    # exit 1 if anything differs
-python3 -m unittest scripts.test_bootstrap scripts.test_bootstrap_github scripts.test_bootstrap_check
+python3 -m unittest scripts.test_bootstrap scripts.test_bootstrap_github scripts.test_bootstrap_check scripts.test_bootstrap_steps scripts.test_bootstrap_start
 ```
 
 `check` (code in `bootstrap_check.py`) is a read-only status report: it prints each step with
@@ -22,6 +27,62 @@ settings (the `github --check` logic; skipped with a note without `gh`, when `gh
 or before `project-context.toml` is valid), the board credential (optional; a non-failing hint appears when reviews are required and only `PROJECT_BOARD_TOKEN` is set), and the agent files
 of the selected tools, compared by content like `agent_setup.py sync` does. It writes nothing
 locally or on GitHub.
+
+`check --json` (code in `bootstrap_steps.py`) prints exactly one JSON document on stdout, with all
+11 steps (`id`, `state`, `blocking`, `actor`, `needs_confirmation`, `performable`, `action`,
+`details` and more), `result`, `next_step`, `default_branch`, `bootstrap_merged` and an integer
+`format_version`. It never writes and never runs `git fetch`; a failing `gh` call makes the steps
+that need GitHub `not_checked` instead of ending the report. Exit codes: 0 when `result` is
+`complete` or `complete_with_manual_settings`, 1 when it is `incomplete`, 2 when no report could be
+made (a message on stderr, nothing on stdout). The fields and every step's `details` keys are in
+[Machine-readable status](../docs/bootstrap.md#machine-readable-status).
+
+`start` (code in `bootstrap_start.py`, with the step catalogue in `bootstrap_steps.py`) works
+through the steps from the first unfinished one. At the five steps it can do (`bootstrap_issue`,
+`project_context`, `github_settings`, `pull_request`, `first_sync`) it prints a preview ending in
+a step-name line (`Confirm "<fixed step label>":`) and `confirm: <step-id>@<digest>` (copy the
+latter) and, in a terminal, asks `Proceed? [y/N]`. Without a terminal or with
+`--no-input` it never prompts: it exits 3 after the preview and prints `To do it, run:` with the
+full command (`--confirm <step-id>@<digest>`, plus `--issue N` when several bootstrap issues are
+listed, and the same `init` flags: `--name`, `--description`, `--owner`, `--project-number` or
+`--create-board`, `--required-approvals`). Progress goes to stderr, and a performed step prints
+`Done: <step>: <result>.`. Without a terminal, missing `init` flags at `project_context` exit 1 with
+`Next step project_context needs your decisions` (exit 2 with `--confirm`). `--guided`, which needs
+`--confirm`, does only the confirmed step and ends with `Done. Go back to your coding agent and reply
+"done".`; the coding agent adds it to the commands it shows you.
+
+`--agents <tool>,…` (`claude`, `copilot`, `codex`) gives your choice of coding agents without asking: `start` saves it as `agent-setup.tools`
+in the local Git config, generates those agents' files and prints
+`Coding agents: <tools> (saved in git config agent-setup.tools).` and a line to run
+`npm run setup-agents` again whenever you change coding agents, then continues with the steps as
+usual. Without it, an interactive run that is not `--guided` asks `Which coding agents do you use?`
+once, when no choice is saved (Enter saves all three); with `--no-input` nothing is asked. There is
+no preview or confirmation: it writes only local Git config and git-ignored files, and the step
+previews and digests do not change. If generating the files fails (exit 2), the choice stays saved
+and a rerun syncs again.
+
+The digest binds the confirmation to the preview and the repository state
+it was made from; a change since gives exit 4 and nothing is done. It stops with exit 1 at the
+steps only a person can do (prerequisites, constitution, roadmap, merge) and prints the action. The
+`bootstrap_issue`, `pull_request` and `first_sync` steps also stop when `origin` names another
+repository than the one `gh` uses or is not a GitHub repository; `pull_request` also checks every
+push URL (`git remote get-url --push --all origin`), and `check --json` reports both steps as not
+performable in those cases. `first_sync` additionally needs the `origin` URL forms the sync itself
+reads (`https://github.com/` or `git@github.com:`) and requires `ROADMAP.md`, `specs/`, `scripts/`,
+`.github/workflows/`, `project-context.toml` and `.specify/memory/constitution.md` to be committed;
+`bootstrap_issue` and `pull_request` accept SSH aliases and `ssh://`. Every preview of
+`bootstrap_issue`, `pull_request`, `first_sync` and `github_settings` includes a
+`Repository: <owner>/<name>` line, so the digest binds the target repository. Branch names in
+printed commands are shell-quoted. Exit codes: 0 complete, 1 stopped or declined (including end of input at the coding-agent question, which saves nothing), 2 error
+(including a malformed `--confirm`, a missing `init` flag after `--confirm`, or `--guided` without
+`--confirm`, or an unknown or empty `--agents` value), 3 confirmation or choice needed, 4
+the preview or next step changed, 130 interrupted. The order of the `--confirm` checks, the trust
+model (it guards against mistakes, not against someone who holds the GitHub rights) and the
+first-sync preview are in
+[Guided path with start](../docs/bootstrap.md#guided-path-with-start). The git and `gh` calls go
+through the same injectable runner as `check` and `github`, `start` runs no write command before a
+confirmation, and the tests (`test_bootstrap_start.py`, `test_bootstrap_steps.py`) use a fake that
+never reaches GitHub.
 
 `init` writes `project-context.toml`: owner and name default from the `origin` remote, it prompts
 in a terminal, and with `--yes` or without a terminal it fails naming the missing flag. A board
@@ -84,6 +145,8 @@ board and honors values explicitly supplied by the user. This file is not a
 secret store and does not override the constitution, workflow gates, GitHub
 CODEOWNERS, or Spec Kit configuration. `--config PATH` validates another file.
 Missing or invalid settings cause an error rather than selecting a default board.
+`project.name` and `project.description` must be a non-empty single line without
+control characters and bidi controls (an existing multi-line or tab-containing value is rejected).
 The project-status workflow validates this file before creating its App token.
 `--board-owner-or-skip` (with `--repository-owner`, reading `HAS_BOARD_APP` and `HAS_BOARD_PAT`) is what the board workflows' shared "Read configured Project owner" step calls: it prints `github_project.owner` on stdout, or an empty owner and a skip notice on stderr when no board credential is configured or the repository is not initialized yet. Once initialized, a missing or invalid file, or an owner that differs from the repository owner, is an error.
 `sync-project-status.py` uses `github_project.owner` and `github_project.number`
@@ -551,8 +614,8 @@ The generated files themselves are git-ignored, so `check` does not look at them
 
 `sync` generates `.github/agents/<name>.agent.md`, `.claude/agents/<name>.md` and `.codex/agents/<name>.toml` from `agent-definitions/<name>.md` and `agents.toml`, and removes generated files without a source. It is run by `npm ci` and `npm run setup-agents` (the latter after asking which tools you use); no Git hook runs it, because checking out a branch must not run its code, so run `python3 scripts/agent_setup.py sync` after switching branches (`bootstrap.py check` reports out-of-date files). The `agent-setup` pre-commit hook only runs `check`. Files you put in these folders yourself are not versioned and Git may delete them, so keep personal agents in your user-level folder (for example `~/.claude/agents/`). Run it after changing `agent-definitions/`.
 
-- Choose the tools with `setup` (below), the repeatable `--tool {claude,copilot,codex}` flag, for example `sync --tool copilot --tool claude`, or with the Git config `agent-setup.tools` (`git config agent-setup.tools copilot`, comma-separated), which plain `sync` and the hooks honour. Without any, all tools are generated, and a `sync` that changed something prints `Generated sub-agents for all tools; run npm run setup-agents to choose yours.` (a sync that changes nothing stays silent). An unknown tool name fails with an error and writes nothing. Generated files of the tools not selected are removed, and so are their agents folders once empty (`.codex/` too; never `.github/` or `.claude/`, nor any folder that still holds anything). Folders are created only for the selected tools.
-- `setup` (`npm run setup-agents`) is interactive: it asks which agents you use (numbers `1) GitHub Copilot  2) Claude Code  3) Codex` or tool names, comma or space separated, asking again on invalid input), offers the current `agent-setup.tools` as the default (Enter keeps it; all tools when none is set), saves it with `git config --local agent-setup.tools <tools>`, prints `Saved: ...` and runs `sync` for those tools. Without a terminal it exits 1 and tells you to use `git config agent-setup.tools <tools>` and `sync`.
+- Choose the tools with `setup` (below), the repeatable `--tool {claude,copilot,codex}` flag, for example `sync --tool copilot --tool claude`, or with the Git config `agent-setup.tools` (`git config agent-setup.tools copilot`, comma-separated), which plain `sync` and the hooks honour. Without any, all tools are generated, and a `sync` that changed something prints `Generated sub-agents for all tools (Claude Code, GitHub Copilot, Codex). Optional: run npm run setup-agents to keep only the ones you use; run it again whenever you change coding agents.` (a sync that changes nothing stays silent). An unknown tool name fails with an error and writes nothing. Generated files of the tools not selected are removed, and so are their agents folders once empty (`.codex/` too; never `.github/` or `.claude/`, nor any folder that still holds anything). Folders are created only for the selected tools.
+- `setup` (`npm run setup-agents`) is interactive: it asks which agents you use (numbers `1) GitHub Copilot  2) Claude Code  3) Codex` or tool names, comma or space separated, asking again on invalid input), offers the current `agent-setup.tools` as the default (Enter keeps it; all tools when none is set), saves it with `git config --local agent-setup.tools <tools>`, prints `Saved: ...` and runs `sync` for those tools. After a successful sync it prints `Run npm run setup-agents again whenever you change coding agents, to generate the files for the new ones.` Without a terminal it exits 1 and tells you to use `git config agent-setup.tools <tools>` and `sync`.
 - Only files carrying the generated marker count as generated. Hand-written files in those folders (for example a personal Claude Code agent in `.claude/agents/`) are never removed by `sync`, but the folders are git-ignored as a whole, so Git may delete such files on checkout. They must stay unversioned: `check` fails when Git tracks any file there, so shared agents belong in `agent-definitions/`. Keep personal agents in your user-level folder (for example `~/.claude/agents/`).
 - Personal (unversioned) Copilot agents in `.github/agents/` must use the `.agent.md` suffix, because any other `.md` file there fails as the old layout.
 

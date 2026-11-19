@@ -39,6 +39,24 @@ PARSE_FIXTURE_TASKS = """# Tasks: Example Feature
 """
 
 
+class OriginRepoTest(unittest.TestCase):
+    def origin(self, url):
+        done = type("Done", (), {"stdout": url + "\n"})()
+        with patch.object(sync_task_issues.subprocess, "run", return_value=done):
+            return sync_task_issues.origin_repo()
+
+    def test_the_remote_forms_name_owner_and_repository(self):
+        for url in ("https://github.com/acme/widgets", "https://github.com/acme/widgets.git",
+                    "https://github.com/acme/widgets/", "https://github.com/acme/widgets.git/",
+                    "git@github.com:acme/widgets.git"):
+            with self.subTest(url=url):
+                self.assertEqual(("acme", "widgets"), self.origin(url))
+
+    def test_a_remote_that_is_not_github_ends_the_process(self):
+        with self.assertRaises(SystemExit):
+            self.origin("https://example.com/acme/widgets.git")
+
+
 class SyncTaskIssuesTest(unittest.TestCase):
     def test_parses_feature_phases_and_tasks(self):
         with tempfile.TemporaryDirectory() as directory:

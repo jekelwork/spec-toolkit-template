@@ -23,12 +23,18 @@ GUIDE = project_context.BOOTSTRAP_GUIDE
 
 
 class Step:
-    def __init__(self, mark, title, next_action=None, note=None):
+    def __init__(self, mark, title, next_action=None, note=None, fixable_by_sync=False):
         self.mark, self.title, self.next_action, self.note = mark, title, next_action, note
+        self.fixable_by_sync = fixable_by_sync  # agent files missing or outdated: sync fixes them
 
 
 def first_line(text):
     return str(text).strip().splitlines()[0] if str(text).strip() else "unknown error"
+
+
+def gh_too_old(error):
+    """True when `gh auth status --active` was refused as an unknown flag (gh older than 2.40)."""
+    return "unknown flag" in str(error).lower()
 
 
 def check_context(root):
@@ -72,8 +78,11 @@ def github_steps(root, run, remote_default, context):
     if context is None:
         return Step(SKIP, "GitHub settings not checked: project-context.toml comes first"), unchecked
     try:
-        run(["gh", "auth", "status", "--hostname", "github.com"])
+        run(["gh", "auth", "status", "--active", "--hostname", "github.com"])
     except bootstrap_github.CommandError as error:
+        if gh_too_old(error):
+            return Step(SKIP, "GitHub settings not checked: gh 2.40 or newer is needed",
+                        f"upgrade gh to 2.40 or newer ({first_line(error)})"), unchecked
         return Step(SKIP, "GitHub settings not checked: gh is not installed or not logged in",
                     f"install gh and run `gh auth login` ({first_line(error)})"), unchecked
     lines = []
@@ -134,10 +143,10 @@ def check_agents(root):
                        and (root / path).read_text(encoding="utf-8") != text]
     sync = "run `npm ci` or `python3 scripts/agent_setup.py sync`"
     if len(missing) == len(wanted):
-        return Step(FAIL, "Agent files are not generated", sync)
+        return Step(FAIL, "Agent files are not generated", sync, fixable_by_sync=True)
     if stale:
         return Step(FAIL, f"Agent files are out of date ({len(stale)} of {len(wanted)})",
-                    "run `python3 scripts/agent_setup.py sync`")
+                    "run `python3 scripts/agent_setup.py sync`", fixable_by_sync=True)
     return Step(OK, "Agent files are generated and up to date")
 
 

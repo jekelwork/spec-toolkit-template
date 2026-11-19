@@ -9,12 +9,22 @@ import copy
 import json
 import os
 import tempfile
+from typing import NamedTuple
 
 import project_context
 
 
 class CommandError(Exception):
-    """An external command (git, gh) failed or is not installed."""
+    """An external command (git, gh) failed or is not installed.
+
+    `stdout` and `returncode` keep what the command printed and how it exited (None when it
+    never ran); the message stays the stderr text.
+    """
+
+    def __init__(self, message="", stdout="", returncode=None):
+        super().__init__(message)
+        self.stdout = stdout
+        self.returncode = returncode
 
 
 # (name, color, description): the labels the sync scripts apply; test_bootstrap_github fails when a
@@ -80,6 +90,16 @@ query($login: String!, $number: Int!) {
   }
 }
 """
+BOARD_WORKFLOWS_QUERY = """
+query($login: String!, $number: Int!) {
+  repositoryOwner(login: $login) {
+    ... on ProjectV2Owner {
+      projectV2(number: $number) { workflows(first: 20) { nodes { name enabled } } }
+    }
+  }
+}
+"""
+BOARD_WORKFLOWS = ("Pull request linked to issue", "Auto-add sub-issues to project")
 REPOSITORY_ID_QUERY = """
 query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }
 """
@@ -223,6 +243,22 @@ def load_board(owner, number, name, run):
             "in project-context.toml to its number"
         )
     return project
+
+
+def load_board_workflows(run, owner, number):
+    """{name: True|False|None} for the board workflows the toolkit needs; None means unknown."""
+    result = dict.fromkeys(BOARD_WORKFLOWS)
+    try:
+        data = graphql(run, BOARD_WORKFLOWS_QUERY, {"login": owner, "number": number})
+        project = ((data.get("data") or {}).get("repositoryOwner") or {}).get("projectV2")
+        nodes = (((project or {}).get("workflows") or {}).get("nodes")) or []
+        for node in nodes:
+            if node.get("name") in result and isinstance(node.get("enabled"), bool):
+                result[node["name"]] = node["enabled"]
+    except (CommandError, ValueError, AttributeError, TypeError):
+        # D6: any error, including a malformed node, makes the whole result None on purpose.
+        return dict.fromkeys(BOARD_WORKFLOWS)
+    return result
 
 
 def scope_hint(error):
@@ -536,35 +572,37 @@ def organization_names(repo, kind, run):
     try:
         data = gh_json(run, ["gh", "api", f"repos/{repo}/actions/organization-{kind}?per_page=100"])
         return {item["name"] for item in data.get(kind, [])}
-    except (CommandError, ValueError, KeyError):
+    except (CommandError, ValueError, KeyError, TypeError, AttributeError):
         return None
 
 
 def report_credentials(repo, run):
     """Information and warnings only; nothing here is a change and values are never read."""
     lines = []
-    names = {}
-    organization_unchecked = False
-    for kind, singular in (("secrets", "secret"), ("variables", "variable")):
-        try:
-            repository = {n["name"] for n in gh_json(
-                run, ["gh", singular, "list", "--repo", repo, "--json", "name"])}
-        except (CommandError, ValueError) as error:
-            lines.append(f"Warning: cannot read {singular} names ({error})")
-            names[kind] = None
-            continue
-        organization = organization_names(repo, kind, run)
+    found = read_credential_secrets(repo, run)
+    organization_unchecked = found.error is None and not found.organization_checked
+    variables = None
+    try:
+        repository = {n["name"] for n in gh_json(
+            run, ["gh", "variable", "list", "--repo", repo, "--json", "name"])}
+    except (CommandError, ValueError) as error:
+        lines.append(f"Warning: cannot read variable names ({error})")
+    except (KeyError, TypeError):
+        lines.append("Warning: cannot read variable names (the variable list could not be read)")
+    else:
+        organization = organization_names(repo, "variables", run)
         organization_unchecked = organization_unchecked or organization is None
-        names[kind] = repository | (organization or set())
+        variables = repository | (organization or set())
+    if found.error:
+        lines.insert(0, f"Warning: cannot read secret names ({found.error})")
     if organization_unchecked:
         lines.append("Note: organization-level secrets and variables were not checked "
                      "(not readable, or the repository is not in an organization)")
-    secrets = names["secrets"]
-    if secrets is not None:
-        app = [name for name in APP_SECRETS if name in secrets]
-        if len(app) == len(APP_SECRETS):
+    if not found.error:
+        kind, app = classify_credential(found.names)
+        if kind == "app":
             lines.append("Board credential: GitHub App configured")
-        elif TOKEN_SECRET in secrets:
+        elif kind == "token":
             lines.append(f"Board credential: {TOKEN_SECRET} configured")
         else:
             lines.append("Board credential: not configured; board sync is skipped until it is "
@@ -572,10 +610,44 @@ def report_credentials(repo, run):
         if app and len(app) < len(APP_SECRETS):
             lines.append(f"Warning: only {app[0]} is set; the GitHub App needs both "
                          f"{' and '.join(APP_SECRETS)} (see {CREDENTIALS_GUIDE})")
-    if names["variables"] is not None:
-        state = "set" if "PHASE_SYNC_AUTO_APPLY" in names["variables"] else "not set"
+    if variables is not None:
+        state = "set" if "PHASE_SYNC_AUTO_APPLY" in variables else "not set"
         lines.append(f"PHASE_SYNC_AUTO_APPLY: {state} (information only)")
     return lines
+
+
+def classify_credential(names):
+    """('app' | 'token' | 'none', the App secrets present) for a set of secret names.
+
+    The one place that decides which board credential wins: a complete App, then the token.
+    """
+    app = [name for name in APP_SECRETS if name in names]
+    if len(app) == len(APP_SECRETS):
+        return "app", app
+    return ("token" if TOKEN_SECRET in names else "none"), app
+
+
+class CredentialSecrets(NamedTuple):
+    """The toolkit's board credential secrets found by name (never a value)."""
+    names: tuple  # only names in APP_SECRETS or TOKEN_SECRET
+    error: str | None  # why the repository's secret names could not be read, or None
+    organization_checked: bool  # False when organization-level secrets were not read (or not tried)
+
+
+def read_credential_secrets(repo, run):
+    """The one read of the repository and organization secret names, as structured data."""
+    try:
+        repository = {n["name"] for n in gh_json(
+            run, ["gh", "secret", "list", "--repo", repo, "--json", "name"])}
+    except (CommandError, ValueError) as error:
+        return CredentialSecrets((), str(error), False)
+    except (KeyError, TypeError):
+        return CredentialSecrets((), "the secret list could not be read", False)
+    organization = organization_names(repo, "secrets", run)
+    wanted = (*APP_SECRETS, TOKEN_SECRET)
+    present = repository | (organization or set())
+    return CredentialSecrets(tuple(name for name in wanted if name in present), None,
+                             organization is not None)
 
 
 def apply_plan(plan):
@@ -598,23 +670,31 @@ def apply_plan(plan):
             applied.append(area)
 
 
-def run_github(args, root, run, remote_default, out=print):
-    """Return the exit code: 0 clean or applied, 1 drift under --check (errors raise ValueError)."""
+def plan_settings(repo, context, run, allow_weaken=False):
+    """Plan labels, board, ruleset and fork approval; return (plan, board url). Reads only."""
+    project_context.validate_repository_owner(context, repo.split("/", 1)[0])
+    board = context["github_project"]
+    plan = plan_labels(repo, run)
+    board_plan, board_url = plan_board(
+        repo, board["owner"], board["number"], context["project"]["name"], run)
+    plan.extend(board_plan)
+    plan.extend(plan_ruleset(repo, project_context.required_approvals(context), run,
+                             allow_weaken))
+    plan.extend(plan_fork_approval(repo, run))
+    return plan, board_url
+
+
+def run_github(args, root, run, remote_default, out=print, hint=True):
+    """Return the exit code: 0 clean or applied, 1 drift under --check (errors raise ValueError).
+
+    `hint=False` leaves out the "run with --apply" advice of a preview, for a caller that applies
+    the plan itself (`bootstrap.py start`)."""
     path = root / project_context.DEFAULT_CONFIG.name
     if not path.exists():
         raise ValueError(project_context.missing_context_message(path))
     context = project_context.load_context(path)
     repo = repository_name(run, root, remote_default)
-    project_context.validate_repository_owner(context, repo.split("/", 1)[0])
-    approvals = project_context.required_approvals(context)
-    board = context["github_project"]
-
-    plan = plan_labels(repo, run)
-    board_plan, board_url = plan_board(
-        repo, board["owner"], board["number"], context["project"]["name"], run)
-    plan.extend(board_plan)
-    plan.extend(plan_ruleset(repo, approvals, run, getattr(args, "allow_weaken", False)))
-    plan.extend(plan_fork_approval(repo, run))
+    plan, board_url = plan_settings(repo, context, run, getattr(args, "allow_weaken", False))
 
     out(f"Repository: {repo} · Board: {board_url}")
     for area in AREAS:
@@ -627,16 +707,22 @@ def run_github(args, root, run, remote_default, out=print):
         out("Nothing to change: labels, board, ruleset and fork PR approval match.")
     for note in plan.notes:
         out(f"Note: {note}")
+    manual = (f"Manual step (the API cannot read or set it): in {board_url} open Workflows and "
+              'check that "Pull request linked to issue" is enabled with Status = In review; '
+              "set it if not.")
+    # The step names a Status option that exists only after the apply, so a preview with changes
+    # leaves it out and --apply prints it last (research D18).
+    nothing_pending = not plan.lines and not plan.warnings
     out("")
-    out(f"Manual step (the API cannot set it): in {board_url} open Workflows and enable "
-        '"Pull request linked to issue" with Status = In review.')
+    if args.check or (nothing_pending and not args.apply):
+        out(manual)
     for line in report_credentials(repo, run):
         out(line)
 
     if args.check:
         return 1 if plan.lines or plan.warnings else 0
     if not args.apply:
-        if plan.lines:
+        if plan.lines and hint:
             out("")
             out("Preview only; run with --apply to make these changes.")
         return 0
@@ -644,4 +730,5 @@ def run_github(args, root, run, remote_default, out=print):
     if plan.lines:
         out("")
         out(f"Applied {len(plan.lines)} change(s).")
+    out(manual)
     return 0
