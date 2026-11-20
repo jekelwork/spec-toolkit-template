@@ -5,7 +5,7 @@ description: Verify that a Spec Kit feature's spec.md and plan.md are merged to 
 
 # Check the plan is merged before generating tasks
 
-Tasks are generated only after the feature's spec and plan pull request is reviewed and merged (README "Spec Kit workflow best practices"). There is no separate tasks pull request: `tasks.md` is generated on the Phase 1 implementation branch and included in the implementation pull request.
+Tasks are generated only after the feature's spec and plan pull request is reviewed and merged (`docs/spec-workflow.md`, "Spec Kit workflow best practices"). There is no separate tasks pull request: `tasks.md` is generated on the Phase 1 implementation branch and included in the implementation pull request.
 
 ## Steps
 

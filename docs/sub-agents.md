@@ -6,7 +6,7 @@ Model and reasoning effort per tool are set in [`agent-definitions/agents.toml`]
 
 ## One copy of every skill and sub-agent
 
-The team uses Copilot, Codex and Claude Code, and every skill and sub-agent exists once (README "Coding agents"):
+The team uses Copilot, Codex and Claude Code, and every skill and sub-agent exists once ([Coding agents](coding-agents.md#coding-agents)):
 
 - **Where things live** (the rules are in `AGENTS.md`): `.claude/skills` is a symlink to the skills. `.github/agents/*.agent.md`, `.claude/agents/*.md` and `.codex/agents/*.toml` are generated locally from the sub-agents and `agents.toml` (by `npm ci`, or `python3 scripts/agent_setup.py sync`; no Git hook regenerates them) and are gitignored. `npm run setup-agents`, `sync --tool <name>` or `git config agent-setup.tools copilot` limits generation to some tools. The three folders are git-ignored as a whole; keep personal agents in your user-level folder (for example `~/.claude/agents/`).
 ## Roster

@@ -8,7 +8,8 @@ from pathlib import Path
 import re
 import sys
 import tomllib
-import unicodedata
+
+import display_text
 
 
 def mask_url_credentials(url):
@@ -49,15 +50,21 @@ MISSING_REVIEW_MESSAGE = (
     "(0 for a solo project)"
 )
 OWNER_PATTERN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
-# Control characters (C0, DEL, C1) and line/paragraph separators: shells and terminals do not
-# reproduce them from a quoted command, so project.name and project.description may not hold them.
-SINGLE_LINE_FORBIDDEN = frozenset({"Cc", "Zl", "Zp"})
-# Bidi embedding, override and isolate controls (category Cf, so listed by code point): they can
-# make a preview read differently from what runs. ZWJ (U+200D) and soft hyphen stay valid.
-SINGLE_LINE_BIDI = frozenset(
-    chr(code) for code in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
-)
+# The characters project.name and project.description may not hold (control characters,
+# separators and format characters except ZWJ, ZWNJ and soft hyphen) are defined once, in
+# display_text.
 SINGLE_LINE_MESSAGE = "must be a non-empty single-line string without control characters"
+
+
+class InvalidValue(ValueError):
+    """A value for an `init` flag that failed validation. The message is
+    `<flag>: <shown value> <requirement>`; the flag and the requirement are kept apart so a
+    caller can print the requirement without the value."""
+
+    def __init__(self, flag, shown, requirement):
+        super().__init__(f"{flag}: {shown} {requirement}")
+        self.flag = flag
+        self.requirement = requirement
 
 
 BOOTSTRAP_MARKERS = (
@@ -161,10 +168,8 @@ def parse_context(text):
             raise ValueError(f"missing {section}.{', '.join(sorted(missing))}{hint}")
     for key in ("name", "description"):
         value = context["project"][key]
-        if not isinstance(value, str) or not value.strip() or any(
-            unicodedata.category(char) in SINGLE_LINE_FORBIDDEN or char in SINGLE_LINE_BIDI
-            for char in value
-        ):
+        if (not isinstance(value, str) or not value.strip()
+                or any(display_text.is_input_forbidden(char) for char in value)):
             raise ValueError(f"project.{key} {SINGLE_LINE_MESSAGE}")
     owner = context["github_project"]["owner"]
     if not isinstance(owner, str) or len(owner) > 39 or not OWNER_PATTERN.fullmatch(owner):

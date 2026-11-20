@@ -9,7 +9,7 @@ permissions:
   pull-requests: read
 
 jobs:
-  spec-and-tasks-separate:
+  spec-and-plan-before-tasks:
     name: Spec and plan merge before tasks
     runs-on: ubuntu-latest
     steps:

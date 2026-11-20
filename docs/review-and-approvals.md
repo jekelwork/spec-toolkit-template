@@ -7,6 +7,26 @@ Reference detail for the pull request rules in [`AGENTS.md`](../AGENTS.md). The 
 - **Approvals are enforced by the branch ruleset** with the count from `[review] required_approvals` in `project-context.toml` (required, with no implicit default; 0 is valid only where the constitution allows a solo project). The constitution sets the count; `required_approvals` mirrors it, and the constitution wins if they differ. GitHub records each review (reviewer, state, reviewed commit, time) on the pull request; nothing is written into spec, plan or task documents.
 - **To see who approved a change,** find its pull request (the merge commit names it) and run `gh pr view <n> --json reviews --jq '.reviews[] | "\(.author.login) \(.state) \(.commit.oid[0:7]) \(.submittedAt)"'`. Count only reviews whose state is `APPROVED` and whose author is not the PR author.
 
+## Bootstrap review exception
+
+`AGENTS.md` says that every review finding is relayed to the user. There is one exception, for the
+bootstrap pull request only (the one the `pull_request` step of `bootstrap.py start` opens, see
+[One bootstrap pull request](bootstrap.md#one-bootstrap-pull-request)), so that the user is not
+handed a list of findings to decide on a first constitution and roadmap:
+
+- The agent fixes the review's Critical and Required findings itself through the skills
+  (`speckit-constitution` for the constitution, `roadmap-write` for the roadmap), and in the first
+  round also its Optional and Nit findings where feasible.
+- A second round fixes only Critical and Required findings and drops the rest. The dropped findings
+  are named as dropped, not handed to the user to decide.
+- A finding whose fix would change what the constitution or roadmap decides is still asked of the
+  user: those decisions stay with the user.
+- FYI findings are still reported to the user as information; no decision is asked.
+- `security-auditor` findings are not covered by this exception: Critical and High findings are
+  fixed and the others relayed as usual.
+- The rule that every finding is relayed to the user applies again after the bootstrap, for every
+  other pull request.
+
 ## Linking the issue in a pull request
 
 For a non-Phase issue branch, the body includes `Closes #<github-issue>`. For a Phase branch it uses `Part of #<phase issue>` instead, because a Phase PR is often partial and a closing keyword would close the Phase on merge. The Phase sync closes a Phase when all its tasks are checked and reopens it when unchecked tasks remain. The PR conventions workflow derives the issue from the validated branch name and adds the right line when it is missing (it leaves a closing keyword the author wrote on a Phase PR alone, because the Phase sync reopens an incomplete Phase).

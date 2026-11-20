@@ -12,6 +12,7 @@ import agent_setup
 import bootstrap_github
 import check_roadmap
 import check_roadmap_dependencies
+import display_text
 import project_context
 
 OK, FAIL, SKIP = "✓", "✗", "–"
@@ -23,9 +24,13 @@ GUIDE = project_context.BOOTSTRAP_GUIDE
 
 
 class Step:
-    def __init__(self, mark, title, next_action=None, note=None, fixable_by_sync=False):
+    def __init__(self, mark, title, next_action=None, note=None, fixable_by_sync=False,
+                 escaped=False):
         self.mark, self.title, self.next_action, self.note = mark, title, next_action, note
         self.fixable_by_sync = fixable_by_sync  # agent files missing or outdated: sync fixes them
+        # True: the text holds lines `run_github` already escaped; `run_check` must not escape
+        # them again. Every other step holds raw text (error messages), escaped where it is printed.
+        self.escaped = escaped
 
 
 def first_line(text):
@@ -104,6 +109,13 @@ def github_steps(root, run, remote_default, context):
 
 
 def credential_step(lines, reviews_required=False):
+    """The credential step from the lines `run_github` printed, which it escaped already."""
+    step = _credential_step(lines, reviews_required)
+    step.escaped = True
+    return step
+
+
+def _credential_step(lines, reviews_required):
     warnings = [line for line in lines
                 if line.startswith("Warning:") and not REFUSED_LINE.match(line)]
     status = next((line.split(": ", 1)[1] for line in lines if line.startswith("Board credential: ")),
@@ -162,17 +174,21 @@ def run_check(args, root, run, remote_default, out=print):
         credential,
         check_agents(root),
     ]
-    out(f"Bootstrap status for {root}")
+    def show(step, text):
+        """One line of the report: error text (from gh, git, the files) is escaped here, once."""
+        out(text if step is not None and step.escaped else display_text.printable(text))
+
+    show(None, f"Bootstrap status for {root}")
     for number, step in enumerate(steps, 1):
-        out(f"  {step.mark} {number}. {step.title}")
+        show(step, f"  {step.mark} {number}. {step.title}")
         if step.mark != OK and step.next_action:
-            out(f"       Next: {step.next_action}")
+            show(step, f"       Next: {step.next_action}")
         if step.note:
-            out(f"       {step.note}")
+            show(step, f"       {step.note}")
     failed = [step for step in steps if step.mark == FAIL]
     out("")
     if failed:
-        out(f"Next: {failed[0].next_action}. See {GUIDE}.")
+        show(failed[0], f"Next: {failed[0].next_action}. See {GUIDE}.")
         return 1
     if settings.mark == SKIP:
         out("Local steps pass; GitHub settings were not verified (see above).")

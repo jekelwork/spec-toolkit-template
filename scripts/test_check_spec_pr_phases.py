@@ -2,6 +2,8 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -113,6 +115,121 @@ class CheckSpecPrPhasesTest(unittest.TestCase):
 
         with patch("sys.stdout", io.StringIO()):
             self.assertEqual(0, check.run_plan_merged(args))
+
+
+class RealGitTest(unittest.TestCase):
+    """The plan-merged check against real objects: a clone of a local bare `origin`."""
+
+    # Git variables that would point git at another repository or object store.
+    INHERITED_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                         "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR")
+
+    def setUp(self):
+        # Isolate from the user's and system git config (signing, hooks, default branch) and
+        # from an inherited repository location; the production code inherits os.environ.
+        environment = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
+                                              "GIT_CONFIG_NOSYSTEM": "1"})
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in self.INHERITED_GIT_ENV:
+            os.environ.pop(name, None)  # patch.dict restores them on cleanup
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name).resolve()
+        self.remote, self.work = base / "origin.git", base / "work"
+        self.git(base, "init", "-q", "--bare", "-b", "main", str(self.remote))
+        self.git(base, "clone", "-q", str(self.remote), str(self.work))
+        self.git(self.work, "checkout", "-q", "-b", "main")
+        self.git(self.work, "config", "user.name", "Test")
+        self.git(self.work, "config", "user.email", "test@example.com")
+        self.git(self.work, "config", "commit.gpgsign", "false")
+        previous = os.getcwd()
+        os.chdir(self.work)  # the check runs git in the current directory
+        self.addCleanup(os.chdir, previous)
+
+    @staticmethod
+    def git(cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                              text=True).stdout
+
+    def publish(self, *paths):
+        """Commit the files and push them to origin/main."""
+        for path in paths:
+            target = self.work / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("x\n")
+        self.git(self.work, "add", "--", *paths)
+        self.git(self.work, "commit", "-q", "-m", "files")
+        self.git(self.work, "push", "-q", "origin", "main")
+
+    def run_plan_merged(self, feature, ref="origin/main"):
+        args = type("A", (), {"feature": feature, "ref": ref})()
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", out), patch("sys.stderr", err):
+            code = check.run_plan_merged(args)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_missing_on_ref_is_empty_when_both_design_files_are_on_the_ref(self):
+        self.publish(f"{FEATURE}/spec.md", f"{FEATURE}/plan.md")
+
+        self.assertEqual([], check.missing_on_ref(FEATURE, "origin/main"))
+
+    def test_missing_on_ref_names_each_file_that_is_not_there(self):
+        self.publish(f"{FEATURE}/spec.md")
+
+        self.assertEqual(["plan.md"], check.missing_on_ref(FEATURE, "origin/main"))
+        self.assertEqual(["spec.md", "plan.md"], check.missing_on_ref("specs/other", "origin/main"))
+
+    def test_a_file_only_in_the_working_tree_is_not_on_the_ref(self):
+        self.publish(f"{FEATURE}/spec.md", f"{FEATURE}/plan.md")
+        (self.work / "specs/006-new").mkdir(parents=True)
+        (self.work / "specs/006-new/spec.md").write_text("x\n")
+
+        self.assertEqual(["spec.md", "plan.md"], check.missing_on_ref("specs/006-new", "origin/main"))
+
+    def test_plan_merged_passes_when_both_files_are_on_origin_main(self):
+        self.publish(f"{FEATURE}/spec.md", f"{FEATURE}/plan.md")
+
+        code, out, err = self.run_plan_merged(FEATURE)
+
+        self.assertEqual(0, code, err)
+        self.assertIn("spec.md and plan.md are on origin/main", out)
+
+    def test_plan_merged_names_the_missing_file(self):
+        self.publish(f"{FEATURE}/spec.md")
+
+        code, out, err = self.run_plan_merged(FEATURE)
+
+        self.assertEqual(1, code)
+        self.assertIn(f"{FEATURE}: plan.md not found on origin/main", err)
+        self.assertNotIn("spec.md not found", err)
+
+    def test_plan_merged_accepts_a_feature_path_with_a_trailing_slash(self):
+        self.publish(f"{FEATURE}/spec.md", f"{FEATURE}/plan.md")
+
+        code, out, err = self.run_plan_merged(f"{FEATURE}/")
+
+        self.assertEqual(0, code, err)
+        self.assertIn(f"{FEATURE}: spec.md and plan.md are on", out)
+
+    def test_plan_merged_fetches_so_a_file_pushed_by_someone_else_counts(self):
+        other = self.work.parent / "other"
+        self.git(self.work.parent, "clone", "-q", str(self.remote), str(other))
+        self.git(other, "config", "user.name", "Other")
+        self.git(other, "config", "user.email", "other@example.com")
+        self.git(other, "config", "commit.gpgsign", "false")
+        self.publish(".keep")  # origin/main exists locally, without the feature
+        self.git(other, "pull", "-q", "origin", "main")
+        for name in ("spec.md", "plan.md"):
+            (other / FEATURE).mkdir(parents=True, exist_ok=True)
+            (other / FEATURE / name).write_text("x\n")
+        self.git(other, "add", "--", FEATURE)
+        self.git(other, "commit", "-q", "-m", "feature")
+        self.git(other, "push", "-q", "origin", "HEAD:main")
+
+        code, _, err = self.run_plan_merged(FEATURE)
+
+        self.assertEqual(0, code, err)
 
 
 if __name__ == "__main__":

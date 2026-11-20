@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import tempfile
@@ -13,7 +14,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bootstrap  # noqa: E402
+import bootstrap_check  # noqa: E402
+import bootstrap_github  # noqa: E402
 import bootstrap_start  # noqa: E402
+from display_text_testing import raw_unsafe  # noqa: E402
 import bootstrap_steps  # noqa: E402
 import project_context  # noqa: E402
 import test_bootstrap_check  # noqa: E402
@@ -366,7 +370,8 @@ class InitValidationTest(BootstrapTestCase):
 
     def test_bidi_controls_are_rejected_before_writing(self):
         for flag in ("--name", "--description"):
-            for char in ("\U0000202a", "\U0000202e", "\U00002066", "\U00002069"):
+            for char in ("\U0000202a", "\U0000202e", "\U00002066", "\U00002069",
+                         "\U0000200e", "\U0000200f", "\U0000061c"):
                 with self.subTest(flag=flag, character=f"U+{ord(char):04X}"):
                     base = {"--name": "N", "--description": "D", "--owner": "acme",
                             "--project-number": "1", "--required-approvals": "1"}
@@ -375,6 +380,20 @@ class InitValidationTest(BootstrapTestCase):
                     self.assertEqual(code, 1)
                     self.assertIn(f"{flag}: 'a\\u{ord(char):04x}b' must be a non-empty "
                                   "single-line string without control characters", self.err)
+                    self.assertFalse(self.target.exists())
+
+    def test_other_format_characters_are_rejected_before_writing(self):
+        for flag in ("--name", "--description"):
+            for code in (0x200B, 0x2060, 0xFEFF, 0xE0041):
+                with self.subTest(flag=flag, character=f"U+{code:04X}"):
+                    base = {"--name": "N", "--description": "D", "--owner": "acme",
+                            "--project-number": "1", "--required-approvals": "1"}
+                    base[flag] = f"a{chr(code)}b"
+                    code_ = self.init(*[f"{k}={v}" for k, v in base.items()])
+                    self.assertEqual(code_, 1)
+                    self.assertIn("must be a non-empty single-line string without control "
+                                  "characters", self.err)
+                    self.assertFalse(raw_unsafe(self.err), repr(self.err))
                     self.assertFalse(self.target.exists())
 
     def test_zero_width_joiner_and_soft_hyphen_still_pass(self):
@@ -425,8 +444,11 @@ class ValidateInMemoryTest(unittest.TestCase):
 
         with self.assertRaises(ValueError) as raised:
             bootstrap.validate(context)
+        # the message holds the raw value; it is escaped where it is printed
+        self.assertEqual("--name: 'w" + chr(0xDC80) + "' contains characters that cannot be "
+                         "written as UTF-8", str(raised.exception))
         self.assertEqual("--name: 'w\\udc80' contains characters that cannot be written as UTF-8",
-                         str(raised.exception))
+                         bootstrap.display_text.error_text(raised.exception))
 
     def test_the_unwritable_value_names_its_own_flag(self):
         for section, key, flag in (("project", "description", "--description"),
@@ -440,6 +462,43 @@ class ValidateInMemoryTest(unittest.TestCase):
                 self.assertTrue(str(raised.exception).startswith(f"{flag}: "))
                 self.assertIn("cannot be written as UTF-8", str(raised.exception))
                 self.assertNotIn("codec", str(raised.exception))
+
+    def test_an_invalid_value_raises_an_error_carrying_the_flag_and_the_requirement(self):
+        for context, flag, requirement in (
+                ({**self.CONTEXT, "review": {"required_approvals": -1}},
+                 "--required-approvals", "must be a non-negative integer"),
+                ({**self.CONTEXT, "project": {"name": "w\udc80", "description": "D"}},
+                 "--name", "contains characters that cannot be written as UTF-8")):
+            with self.subTest(flag=flag):
+                with self.assertRaises(bootstrap.project_context.InvalidValue) as raised:
+                    bootstrap.validate(context)
+
+                self.assertIsInstance(raised.exception, ValueError)
+                self.assertEqual(flag, raised.exception.flag)
+                self.assertEqual(requirement, raised.exception.requirement)
+
+    def test_init_and_github_reject_abbreviated_options(self):
+        parser = bootstrap.build_parser()
+        for argv in (["init", "--desc", "D"], ["init", "--proj", "3"], ["github", "--appl"],
+                     ["github", "--allow", "x"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(SystemExit) as raised, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    parser.parse_args(argv)
+                self.assertEqual(2, raised.exception.code)
+
+    def test_every_documented_init_and_github_option_still_parses(self):
+        parser = bootstrap.build_parser()
+        init = parser.parse_args([
+            "init", "--name", "n", "--description", "D", "--owner", "o", "--project-number", "3",
+            "--required-approvals", "1", "--force"])
+        self.assertEqual(("n", "D", "o", 3, 1, True),
+                         (init.name, init.description, init.owner, init.project_number,
+                          init.required_approvals, init.force))
+        self.assertTrue(parser.parse_args(["init", "--create-board"]).create_board)
+        self.assertTrue(parser.parse_args(["github", "--apply"]).apply)
+        self.assertTrue(parser.parse_args(["github", "--check"]).check)
+        self.assertTrue(parser.parse_args(["github", "--apply", "--allow-weaken"]).allow_weaken)
 
     def test_an_invalid_context_keeps_its_flag_message_without_file_io(self):
         context = {**self.CONTEXT, "review": {"required_approvals": -1}}
@@ -634,6 +693,7 @@ READ_COMMANDS = (
     ["gh", "variable", "list"], ["git", "remote", "get-url"], ["git", "branch", "--show-current"],
     ["git", "branch", "--format=%(refname:short)"], ["git", "status", "--porcelain"],
     ["git", "rev-parse"], ["git", "merge-base", "--is-ancestor"], ["git", "cat-file", "-e"],
+    ["git", "config", "--get"],  # only the exact read of a value; `git config key value` writes
     # the first-sync dry run: the script without --apply (is_read rejects any argv with it)
     ["python3", "scripts/sync-roadmap-issues.py"],
 )
@@ -756,6 +816,33 @@ class ReadingRun(test_bootstrap_check.CheckGitHub):
         self.extra_calls = []
         self.bodies = {}  # call index -> body, read before the temp file goes
 
+    @staticmethod
+    def repository_answer(argv):
+        """What each read of a repository with bootstrap merged returns, in gh's output shape
+        (a listing of branch names with --jq, the issue listing as one JSON object per line)."""
+        joined = " ".join(argv)
+        if argv[:3] == ["gh", "repo", "view"] and "defaultBranchRef" in argv:
+            return '{"defaultBranchRef": {"name": "main"}}'
+        if argv[:3] == ["gh", "pr", "list"]:
+            return "[]"
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            return "" if "/issues?" in joined else "main\n"  # no issues yet
+        if argv[:2] == ["gh", "api"] and "/contents/" in argv[-1]:
+            path = argv[-1].split("/contents/")[1].split("?")[0]
+            return {"project-context.toml": test_bootstrap_check.CONTEXT.format(approvals=1),
+                    "ROADMAP.md": test_bootstrap_check.ROADMAP,
+                    ".specify/memory/constitution.md": "# Constitution\n",
+                    }.get(path)  # any other path is unanswered, so the parent fake rejects it
+        if argv[:2] == ["gh", "api"] and "/branches/" in joined:
+            return "abc\n"
+        if argv[:3] == ["git", "rev-parse", "HEAD"]:
+            return "abc\n"
+        if argv[:4] == ["git", "config", "--get", "remote.origin.url"]:
+            return "https://github.com/acme/widgets.git\n"
+        if argv[0] == "python3":  # the first-sync dry run: nothing pending
+            return ""
+        return None
+
     def __call__(self, argv, cwd=None):
         argv = list(argv)
         self.bodies[len(self.calls)] = FakeGitHub.body(argv)
@@ -771,9 +858,10 @@ class ReadingRun(test_bootstrap_check.CheckGitHub):
             if argv[: len(prefix)] == prefix:
                 self.calls.append(argv)
                 return answer
-        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+        answer = self.repository_answer(argv)
+        if answer is not None:
             self.calls.append(argv)
-            return "main\n"
+            return answer
         try:
             return super().__call__(argv, cwd)
         except AssertionError:  # an unanswered command: already recorded by FakeGitHub
@@ -917,8 +1005,14 @@ class CheckJsonTest(unittest.TestCase):
         before = test_bootstrap_check.snapshot(self.root)
         run = ReadingRun()
         self.assertIn(self.check_json(run=run), (0, 1))
-        self.assertEqual(len(json.loads(self.out)["steps"]), 11)
+        steps = {step["id"]: step for step in json.loads(self.out)["steps"]}
+        self.assertEqual(len(steps), 11)
+        # every detector reached a real answer; a step stuck at not_checked proves nothing
+        self.assertEqual([], [(i, s["title"]) for i, s in steps.items()
+                              if s["state"] == "not_checked"])
         self.assertGreater(len(run.calls), 3, "the builder stopped before reaching its reads")
+        for prefix in (["gh", "pr", "list"], ["python3", "scripts/sync-roadmap-issues.py"]):
+            self.assertTrue(any(call[:len(prefix)] == prefix for call in run.calls), prefix)
         self.assertEqual(run.writes, [])
         self.assert_only_reads(run)
         self.assertEqual(test_bootstrap_check.snapshot(self.root), before)
@@ -1104,13 +1198,16 @@ class StartSubcommandTest(BootstrapTestCase):
 
         code = self.start("--no-input", "--agents", "claude,copilot", run=run)
 
-        self.assertEqual(3, code)
+        self.assertEqual(0, code)  # without --confirm it ends here, with no preview
+        self.assertIn("Go back to your coding agent and tell it the choice is saved.", self.out)
+        self.assertNotIn("confirm:", self.out)
         self.assertIn(("git", "config", "--local", "agent-setup.tools", "claude,copilot"),
                       run.calls)
         self.assertIn(("python3", "scripts/agent_setup.py", "sync"), run.calls)
         self.assertIn("Coding agents: claude, copilot (saved in git config agent-setup.tools).",
                       self.out)
-        self.assertIn("Generating the agent files…", self.err)
+        self.assertIn("Generating the agent files…", self.out)
+        self.assertNotIn("Generating the agent files…", self.err)
 
     def test_agents_with_an_unknown_name_exits_2_and_runs_nothing(self):
         run = test_bootstrap_start.SyncRun()
@@ -1125,6 +1222,17 @@ class StartSubcommandTest(BootstrapTestCase):
     def test_the_guided_option_is_listed_in_the_help_usage(self):
         help_text = " ".join(bootstrap.build_parser().format_help().split())
         self.assertIn("[--issue N] [--guided]]", help_text)
+
+    def test_the_full_dry_run_option_is_listed_in_the_help_usage_and_reaches_the_engine(self):
+        help_text = " ".join(bootstrap.build_parser().format_help().split())
+        self.assertIn("[--full-dry-run]", help_text)
+
+        run = test_bootstrap_start.SyncRun(
+            output="[dry-run] create EPIC: 001 First\n[dry-run] add #5 to project o/1\n")
+        self.assertEqual(3, self.start("--no-input", "--full-dry-run", run=run))
+        self.assertIn("[dry-run] create EPIC: 001 First", self.out)
+        self.assertIn("--confirm first_sync@", self.out)
+        self.assertRegex(self.out, r"first_sync@[0-9a-f]{12} --full-dry-run\n")
 
     def test_the_arguments_after_start_reach_the_engine_unchanged(self):
         argv = ["--no-input", "--confirm", "bootstrap_issue@0123456789ab", "--issue", "7",
@@ -1169,10 +1277,12 @@ class StartSubcommandTest(BootstrapTestCase):
             bootstrap.main(["start"], root=self.root, is_tty=False)
             self.assertIs(bootstrap.run_command, engine.call_args.kwargs["run"])
             self.assertIs(bootstrap_start.run_captured, engine.call_args.kwargs["run_captured"])
+            self.assertIs(bootstrap_start.run_timed, engine.call_args.kwargs["run_timed"])
 
             bootstrap.main(["start"], root=self.root, run=test_bootstrap_start.SyncRun(),
                            is_tty=False)
             self.assertIsNone(engine.call_args.kwargs["run_captured"])
+            self.assertIsNone(engine.call_args.kwargs["run_timed"])
 
             injected = object()
             bootstrap.main(["start"], root=self.root, run=test_bootstrap_start.SyncRun(),
@@ -1185,8 +1295,26 @@ class StartSubcommandTest(BootstrapTestCase):
         code = self.start("--no-input", run=run, run_captured=run.captured)
 
         self.assertEqual(3, code)
-        self.assertIn("warning: ignoring a marker", self.err)
-        self.assertNotIn("warning: ignoring a marker", self.out)
+        self.assertIn("warning: ignoring a marker", self.out)
+        self.assertNotIn("warning: ignoring a marker", self.err)
+        self.assertEqual("", self.err)  # a successful run leaves stderr empty
+
+    def test_progress_lines_go_to_stdout_in_order_before_the_preview(self):
+        run = test_bootstrap_start.SyncRun(stderr="warning: ignoring a marker\n")
+
+        self.start("--no-input", run=run, run_captured=run.captured)
+
+        lines = self.out.splitlines()
+        self.assertEqual("Reading the repository and GitHub state…", lines[0])
+        self.assertEqual("warning: ignoring a marker", lines[1])
+        self.assertLess(self.out.index("warning:"), self.out.index("Next step"))
+
+    def test_a_failure_is_on_stderr_and_not_on_stdout(self):
+        code = self.start("--no-input", "--confirm", "first_sync@0123456789ab")
+
+        self.assertEqual(4, code)
+        self.assertIn("the preview changed since you confirmed it", self.err)
+        self.assertNotIn("the preview changed", self.out)
 
     def test_an_error_escaping_start_exits_2_not_1(self):
         for error in (bootstrap.CommandError("boom"), OSError("disk"), ValueError("bad")):
@@ -1203,6 +1331,114 @@ class StartSubcommandTest(BootstrapTestCase):
         source = Path(bootstrap_start.__file__).read_text()
 
         self.assertNotRegex(source, r"(?m)^\s+import bootstrap\s*(#.*)?$")
+
+
+BIDI, ZWSP, BOM = chr(0x202E), chr(0x200B), chr(0xFEFF)
+
+
+class TomlStringTest(unittest.TestCase):
+    def test_every_output_unsafe_character_is_written_as_a_toml_unicode_escape(self):
+        for code in (0x00, 0x1B, 0x7F, 0x85, 0x200B, 0x200D, 0x200E, 0x202E, 0x2028, 0x2066,
+                     0xFEFF, 0xAD, 0xE0001):
+            char = chr(code)
+            with self.subTest(code=hex(code)):
+                written = bootstrap.toml_string(f"a{char}b")
+
+                self.assertFalse(raw_unsafe(written), repr(written))
+                self.assertNotIn(char, written)
+                self.assertEqual(f"a{char}b", tomllib.loads(f"k = {written}")["k"])
+
+    def test_named_escapes_and_ordinary_text_are_unchanged(self):
+        self.assertEqual('"a\\nb\\tc\\\\\\"d \u00e9 \U0001f600"',
+                         bootstrap.toml_string('a\nb\tc\\"d \u00e9 \U0001f600'))
+
+
+class EscapedMessagesTest(BootstrapTestCase):
+    def test_the_prompt_default_is_escaped(self):
+        self.root = self.root.parent / f"d{BIDI}x\\y"
+        self.root.mkdir()
+        self.target = self.root / "project-context.toml"
+
+        self.init("--description", "D", "--owner", "acme", "--project-number", "1",
+                  "--required-approvals", "1", run=FakeRun(remote=None), tty=True,
+                  answers=[""])
+
+        self.assertEqual(1, len(self.prompts))
+        self.assertFalse(raw_unsafe(self.prompts[0]), repr(self.prompts[0]))
+        self.assertIn("[d\\u202ex\\\\y]", self.prompts[0])
+
+    def test_an_error_message_is_escaped(self):
+        for command in ("init", "github", "check"):
+            with self.subTest(command=command):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    with mock.patch.object(bootstrap, "init",
+                                           side_effect=ValueError(f"bad {BIDI}\x1b")), \
+                         mock.patch.object(bootstrap_github, "run_github",
+                                           side_effect=ValueError(f"bad {BIDI}\x1b")), \
+                         mock.patch.object(bootstrap_check, "run_check",
+                                           side_effect=ValueError(f"bad {BIDI}\x1b")):
+                        code = bootstrap.main([command], root=Path(tempfile.gettempdir()),
+                                              run=FakeRun(), is_tty=False)
+
+                self.assertNotEqual(0, code)
+                self.assertFalse(raw_unsafe(err.getvalue()), repr(err.getvalue()))
+                self.assertIn(f"bootstrap {command} failed: bad \\u202e\\x1b", err.getvalue())
+
+    def test_a_message_that_quotes_a_value_is_escaped_once(self):
+        # Messages hold raw values; a backslash is doubled once, where the message is printed.
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = bootstrap.main(
+                ["init", "--description", "D", "--project-number", "1",
+                 "--owner", "a\\b" + BIDI], root=self.root, run=FakeRun(), is_tty=False)
+
+        self.assertEqual(1, code)
+        self.assertIn("--owner: 'a\\\\b" + "\\" + "u202e' must be", err.getvalue())
+
+    def test_a_usage_error_of_the_top_level_parser_is_escaped_once(self):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as raised:
+            bootstrap.main(["github", "--bogus" + BIDI + "\\"], root=self.root,
+                           run=FakeRun(), is_tty=False)
+
+        self.assertEqual(2, raised.exception.code)
+        self.assertTrue(err.getvalue().endswith(
+            "error: unrecognized arguments: --bogus\\u202e\\\\\n"), err.getvalue())
+
+    def test_an_invalid_subcommand_is_escaped_once(self):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit):
+            bootstrap.main(["x" + BIDI], root=self.root, run=FakeRun(), is_tty=False)
+
+        self.assertIn("error: argument command: invalid choice: 'x\\u202e' (choose from",
+                      err.getvalue())
+
+    def test_a_line_feed_in_a_usage_error_stays_on_one_line(self):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit):
+            bootstrap.main(["github", "--bogus\nApplied 3 change(s)."], root=self.root,
+                           run=FakeRun(), is_tty=False)
+
+        self.assertTrue(err.getvalue().endswith(
+            "error: unrecognized arguments: --bogus\\nApplied 3 change(s).\n"), err.getvalue())
+
+    def test_the_check_json_failure_message_is_escaped(self):
+        def build(root, run, remote_default, push_remote_default=None):
+            raise RuntimeError(f"s{BIDI}\x1b")
+
+        err = io.StringIO()
+        with mock.patch.object(bootstrap_steps, "build_report", build), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = bootstrap.main(["check", "--json"], root=self.root, run=FakeRun(),
+                                  is_tty=False)
+
+        self.assertEqual(2, code)
+        self.assertFalse(raw_unsafe(err.getvalue()), repr(err.getvalue()))
+        self.assertIn("\\u202e\\x1b", err.getvalue())
 
 
 if __name__ == "__main__":

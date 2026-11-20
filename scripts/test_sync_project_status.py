@@ -417,9 +417,8 @@ class ProjectConfigurationTest(unittest.TestCase):
 
 class WorkflowProjectConfigurationTest(unittest.TestCase):
     def test_app_token_is_scoped_to_projects_and_issue_reads(self):
-        workflow = (SCRIPT_PATH.parent.parent / ".github/workflows/sync-project-status.yml").read_text()
-        token_step = workflow.split("- name: Create project-scoped token", 1)[1]
-        token_step = token_step.split("- name: Reconcile statuses", 1)[0]
+        action = (SCRIPT_PATH.parent.parent / ".github/actions/board-token/action.yml").read_text()
+        token_step = action.split("- name: Create optional board token", 1)[1]
         self.assertIn("permission-issues: read", token_step)
         self.assertIn("permission-organization-projects: write", token_step)
         self.assertNotIn("permission-contents", token_step)
@@ -433,9 +432,9 @@ class WorkflowProjectConfigurationTest(unittest.TestCase):
         self.assertNotIn("group: issue-sync", workflow)
 
     def test_workflow_validates_shared_context_before_token_creation(self):
-        workflow = (SCRIPT_PATH.parent.parent / ".github/workflows/sync-project-status.yml").read_text()
-        validation = workflow.split("- name: Read configured Project owner\n", 1)[1]
-        validation, _ = validation.split("- name: Create project-scoped token", 1)
+        action = (SCRIPT_PATH.parent.parent / ".github/actions/board-token/action.yml").read_text()
+        validation = action.split("- name: Read configured Project owner\n", 1)[1]
+        validation, _ = validation.split("- name: Create optional board token", 1)
         self.assertIn("python3 scripts/project_context.py", validation)
         self.assertIn("--repository-owner", validation)
 
