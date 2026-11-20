@@ -20,6 +20,7 @@ import bootstrap_check  # noqa: E402
 import bootstrap_github  # noqa: E402
 import bootstrap_start  # noqa: E402
 import bootstrap_steps  # noqa: E402
+from display_text_testing import raw_unsafe  # noqa: E402
 import project_board  # noqa: E402
 import pr_conventions  # noqa: E402
 import project_context  # noqa: E402
@@ -796,12 +797,45 @@ class BootstrapIssueTest(unittest.TestCase):
 
         self.assertTrue(step.performable)
 
-    def test_an_untracked_folder_or_a_rename_counts_as_another_file(self):
-        for status in ("?? notes/a.md\0", "R  docs/ROADMAP.md\0ROADMAP.md\0"):
-            with self.subTest(status=status):
-                step, _ = self.detect(IssueWorld([], local=["main"], status=status))
+    def test_a_rename_counts_as_another_file(self):
+        status = "R  docs/ROADMAP.md\0ROADMAP.md\0"
 
-                self.assertFalse(step.performable)
+        step, _ = self.detect(IssueWorld([], local=["main"], status=status))
+
+        self.assertFalse(step.performable)
+
+    def test_untracked_files_outside_the_bootstrap_files_stay_performable_and_are_named(self):
+        status = "?? notes/a.md\0?? scratch.txt\0?? ROADMAP.md\0"
+
+        step, _ = self.detect(IssueWorld([issue(7)], local=["main"], status=status))
+
+        self.assertEqual(("todo", True), (step.state, step.performable))
+        self.assertTrue(step.title.endswith(
+            "; untracked files, carried over and not committed: notes/a.md, scratch.txt"),
+            step.title)
+        self.assertNotIn("other uncommitted", step.title)
+        self.assertEqual(1, bootstrap_steps.FORMAT_VERSION)
+
+    def test_a_changed_tracked_file_blocks_with_the_commit_stash_or_revert_text(self):
+        status = " M scripts/a.py\0A  docs/b.md\0"
+
+        step, _ = self.detect(IssueWorld([issue(7)], local=["main"], status=status))
+
+        self.assertEqual(("todo", False), (step.state, step.performable))
+        self.assertEqual("Commit, stash or revert the changes to scripts/a.py, docs/b.md, "
+                         "then run start again.", step.action["text"])
+
+    def test_tracked_and_untracked_changes_together_block_and_name_both(self):
+        status = " M scripts/a.py\0?? notes/a.md\0"
+
+        step, _ = self.detect(IssueWorld([issue(7)], local=["main"], status=status))
+
+        self.assertFalse(step.performable)
+        self.assertIn("changed tracked files: scripts/a.py", step.title)
+        self.assertNotIn("other uncommitted", step.title)
+        self.assertIn("untracked files, carried over and not committed: notes/a.md", step.title)
+        self.assertIn("scripts/a.py", step.action["text"])
+        self.assertNotIn("notes/a.md", step.action["text"])
 
     def test_an_untracked_constitution_in_a_new_folder_is_a_bootstrap_file(self):
         status = "?? .specify/memory/constitution.md\0"
@@ -2403,7 +2437,8 @@ class FirstSyncTest(unittest.TestCase):
                 step = self.detect(run, [])
 
                 self.assertIn(["git", "status", "--porcelain", "-z", "--", "ROADMAP.md", "specs/",
-                               "scripts/", ".github/workflows/", "project-context.toml",
+                               "scripts/", ".github/workflows/", ".github/actions/",
+                               "project-context.toml",
                                ".specify/memory/constitution.md"], run.calls)
                 self.assertIsNone(step.details["pending_changes"])
                 self.assertIn(path, step.action["text"])
@@ -3175,6 +3210,108 @@ class ReportTest(unittest.TestCase):
         for call in run.calls:
             self.assertNotIn(call[:3], (["gh", "issue", "create"], ["git", "commit"],
                                         ["git", "push"], ["gh", "pr", "create"]), call)
+
+
+BIDI, LRM, ZWSP, BOM = chr(0x202E), chr(0x200E), chr(0x200B), chr(0xFEFF)
+
+
+class UnsafeCommandTest(unittest.TestCase):
+    """A command is never escaped (it would not run as shown): one with an unsafe character is
+    dropped, and the action text says why."""
+
+    def test_an_action_without_unsafe_characters_is_unchanged(self):
+        self.assertEqual({"text": "Do it.", "command": "git switch 'a b\\c'", "doc": "d"},
+                         bootstrap_steps.action("Do it.", "git switch 'a b\\c'", "d"))
+
+    def test_an_action_with_an_unsafe_command_has_no_command_and_says_why(self):
+        for char in (BIDI, LRM, ZWSP, BOM, "\x1b", "\x85", chr(0x2028)):
+            with self.subTest(character=hex(ord(char))):
+                made = bootstrap_steps.action("Do it.", f"git switch a{char}b", "d")
+
+                self.assertIsNone(made["command"])
+                self.assertTrue(made["text"].startswith("Do it. "))
+                self.assertIn("cannot be shown safely", made["text"])
+                self.assertIn("by hand", made["text"])
+                self.assertEqual("d", made["doc"])
+
+    def test_a_default_branch_with_an_unsafe_character_leaves_the_command_out(self):
+        run = IssueWorld([issue(7)], local=["main"]).run()
+
+        step = bootstrap_steps.detect_bootstrap_issue(
+            Path("."), run, REPO, context(default=f"rel{BIDI}ease"))
+
+        self.assertIsNone(step.action["command"])
+        self.assertIn("cannot be shown safely", step.action["text"])
+
+
+class EscapeReportTest(unittest.TestCase):
+    """`check --json` escapes the text a guide agent would echo, and nothing else."""
+
+    def report(self):
+        hostile = f"a{BIDI}b{LRM}{ZWSP}{BOM}\x1b[2K\x85" + chr(0x2028) + "\\x1b"
+        steps = [
+            dataclasses.asdict(bootstrap_steps.make_step(
+                "bootstrap_issue", "todo", hostile, performable=True,
+                action={"text": hostile, "command": "git switch 'a\\b'", "doc": "docs/x.md#y"},
+                details={"candidates": [{"number": 7, "title": hostile, "branch": hostile}],
+                         "agent_tools": [hostile], "ruleset_warning": hostile,
+                         "dry_error": hostile, "nested": {"files": (hostile,)},
+                         "count": 3, "flag": True, "none": None})),
+            dataclasses.asdict(bootstrap_steps.make_step(
+                "prerequisites", "done", "fine")),
+        ]
+        return {"format_version": 1, "result": "incomplete", "next_step": "bootstrap_issue",
+                "bootstrap_merged": False, "default_branch": hostile, "steps": steps}
+
+    SHOWN = "a\\u202eb\\u200e\\u200b\\ufeff\\x1b[2K\\x85\\u2028\\\\x1b"
+
+    def test_titles_texts_details_and_the_default_branch_are_escaped(self):
+        escaped = bootstrap_steps.escape_report(self.report())
+
+        text = json.dumps(escaped, ensure_ascii=False)
+        self.assertFalse(raw_unsafe(text), repr(text))
+        first = escaped["steps"][0]
+        self.assertEqual(self.SHOWN, first["title"])
+        self.assertEqual(self.SHOWN, first["action"]["text"])
+        self.assertEqual(self.SHOWN, escaped["default_branch"])
+        details = first["details"]
+        self.assertEqual([{"number": 7, "title": self.SHOWN, "branch": self.SHOWN}],
+                         details["candidates"])
+        self.assertEqual([self.SHOWN], details["agent_tools"])
+        self.assertEqual(self.SHOWN, details["ruleset_warning"])
+        self.assertEqual(self.SHOWN, details["dry_error"])
+        self.assertEqual([self.SHOWN], list(details["nested"]["files"]))
+        self.assertEqual((3, True, None), (details["count"], details["flag"], details["none"]))
+
+    def test_commands_ids_states_and_docs_are_left_alone_and_the_input_is_not_changed(self):
+        report = self.report()
+        before = json.dumps(report)
+
+        escaped = bootstrap_steps.escape_report(report)
+
+        self.assertEqual(before, json.dumps(report))
+        first = escaped["steps"][0]
+        self.assertEqual("git switch 'a\\b'", first["action"]["command"])
+        self.assertEqual("docs/x.md#y", first["action"]["doc"])
+        self.assertEqual(("bootstrap_issue", "todo"), (first["id"], first["state"]))
+        self.assertEqual("fine", escaped["steps"][1]["title"])
+        self.assertIsNone(escaped["steps"][1]["action"])
+
+    def test_the_format_version_stays_one(self):
+        self.assertEqual(1, bootstrap_steps.FORMAT_VERSION)
+        self.assertEqual(1, bootstrap_steps.escape_report(self.report())["format_version"])
+
+    def test_the_cli_prints_the_escaped_report(self):
+        out = io.StringIO()
+        with mock.patch.object(bootstrap_steps, "build_report",
+                               lambda *args, **kwargs: self.report()), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            bootstrap.main(["check", "--json"], root=Path("."), run=lambda *a, **k: "",
+                           is_tty=False)
+
+        document = json.loads(out.getvalue())
+        self.assertEqual(self.SHOWN, document["steps"][0]["title"])
+        self.assertFalse(raw_unsafe(out.getvalue()), repr(out.getvalue()))
 
 
 if __name__ == "__main__":

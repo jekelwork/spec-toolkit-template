@@ -1,0 +1,62 @@
+name: Set up the board credential
+description: >-
+  Reads the configured Project owner and creates the optional GitHub App token for the Project board.
+  Run it after checking out trusted code (it executes scripts/project_context.py). It derives which
+  board credential is configured from its inputs; the caller passes the secrets and no job env.
+
+inputs:
+  client-id:
+    description: Client ID (or App ID) of the board GitHub App; pass secrets.PROJECT_STATUS_APP_ID.
+    required: false
+    default: ''
+  private-key:
+    description: Private key of the board GitHub App; pass secrets.PROJECT_BOARD_APP_PRIVATE_KEY.
+    required: false
+    default: ''
+  has-board-pat:
+    description: Whether the board token PAT is configured; pass whether secrets.PROJECT_BOARD_TOKEN is non-empty.
+    required: false
+    default: 'false'
+
+outputs:
+  owner:
+    description: The configured Project owner, or empty when the board sync is skipped.
+    value: ${{ steps.project-config.outputs.owner }}
+  token:
+    description: The App installation token, or empty when no App is configured or the owner is empty.
+    value: ${{ steps.app-token.outputs.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Read configured Project owner
+      id: project-config
+      shell: bash
+      env:
+        # project_context.py reads these two flags from the environment.
+        HAS_BOARD_APP: ${{ inputs.client-id != '' && inputs.private-key != '' }}
+        HAS_BOARD_PAT: ${{ inputs.has-board-pat }}
+      run: |
+        # Prints the owner, or a skip notice (no credential, or not initialized yet) and no owner;
+        # fails once the repository is initialized and project-context.toml is missing or invalid.
+        owner=$(python3 scripts/project_context.py --repository-owner "${GITHUB_REPOSITORY%%/*}" --board-owner-or-skip)
+        echo "owner=$owner" >> "$GITHUB_OUTPUT"
+
+    - name: Read the repository name
+      id: repo
+      shell: bash
+      # A schedule payload has no `repository`, so the App token's `repositories` cannot come from the event.
+      run: |
+        echo "name=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+
+    - name: Create optional board token
+      id: app-token
+      if: ${{ inputs.client-id != '' && inputs.private-key != '' && steps.project-config.outputs.owner != '' }}
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        client-id: ${{ inputs.client-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: ${{ steps.project-config.outputs.owner }}
+        repositories: ${{ steps.repo.outputs.name }}
+        permission-issues: read
+        permission-organization-projects: write

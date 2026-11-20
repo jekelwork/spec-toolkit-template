@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -46,6 +47,44 @@ class RoadmapDependencyWorkflowTest(unittest.TestCase):
         ):
             with self.subTest(skill=skill):
                 self.assertFalse((ROOT / ".agents/skills" / skill).exists())
+
+    def test_agent_derives_the_feature_directory(self):
+        # Issue #61: the agent derives specs/<id>-<slug> from the roadmap
+        # entry and passes it explicitly; the user is never asked to set it.
+        def flat(path):
+            return " ".join((ROOT / path).read_text(encoding="utf-8").split())
+
+        entry_skill = flat(".agents/skills/roadmap-entry-check/SKILL.md")
+        self.assertIn(
+            "Derive an explicit `SPECIFY_FEATURE_DIRECTORY=specs/NNN-<slug>` from the "
+            "roadmap entry the user or issue names",
+            entry_skill,
+        )
+        self.assertIn("do not ask the user to set it", entry_skill)
+        self.assertNotIn("from the user or issue instructions", entry_skill)
+        # The slug rule and its example must match roadmap_issues.slugify,
+        # which the sync uses.
+        self.assertIn(
+            "every run of characters other than `a-z` and `0-9` replaced by one hyphen",
+            entry_skill,
+        )
+        self.assertIn('"Don\'t panic" becomes `don-t-panic`', entry_skill)
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            import roadmap_issues
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(roadmap_issues.slugify("Don't panic"), "don-t-panic")
+
+        agents = flat("AGENTS.md")
+        self.assertIn(
+            "derive `SPECIFY_FEATURE_DIRECTORY=specs/<roadmap-id>-<slug>` from the roadmap entry",
+            agents,
+        )
+        self.assertIn("Do not ask the user to set it", agents)
+
+        # docs/bootstrap.md is pinned by test_bootstrap_guide_safety.py.
+        self.assertIn("derived by the agent from the entry", flat("docs/spec-workflow.md"))
 
     def test_exactly_three_roadmap_hooks_are_registered(self):
         skill = ROOT / ".agents/skills/roadmap-dependency-check/SKILL.md"

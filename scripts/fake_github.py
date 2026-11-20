@@ -9,6 +9,8 @@ repository data.
 import json
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -72,6 +74,9 @@ class FakeGitHub:
         self.branches = []
         self.calls = []
         self.fail_on = None
+        # Forces the items per page of every listing when set (tests lower it to span pages).
+        # Left None, the size follows the request's `per_page` like GitHub: 30 by default, max 100.
+        self.page_size = None
         self.project_owner = project_owner
         self.project_number = project_number
         self.project_owner_kind = project_owner_kind
@@ -114,13 +119,49 @@ class FakeGitHub:
         return self.issues[number]
 
     def add_pull_request(self, number, title, body="", head_ref="topic", head_repo=None,
-                         author_association="OWNER"):
+                         author_association="OWNER", author="tester"):
         self.pull_requests[number] = {
             "number": number,
             "title": title,
             "body": body,
             "head": {"ref": head_ref, "repo": {"full_name": head_repo or f"{OWNER}/{REPO}"}},
             "author_association": author_association,
+            "user": {"login": author},
+        }
+
+    @staticmethod
+    def raw_issue(issue):
+        """The issue as the REST API returns it: nested user, label and assignee objects."""
+        return {
+            "number": issue["number"],
+            "id": issue["id"],
+            "node_id": issue["node_id"],
+            "title": issue["title"],
+            "body": issue["body"],
+            "state": issue["state"],
+            "state_reason": issue["state_reason"],
+            "user": {"login": issue["author"]},
+            "author_association": issue["author_association"],
+            "assignees": [{"login": login} for login in issue["assignees"]],
+            "labels": [{"name": name} for name in issue["labels"]],
+        }
+
+    @staticmethod
+    def raw_pull_request(pr):
+        """A pull request as the `/issues` listing returns it: an issue with a `pull_request` key."""
+        return {
+            "number": pr["number"],
+            "id": pr["number"] * 1000 + 1,
+            "node_id": f"PR_{pr['number']}",
+            "title": pr["title"],
+            "body": pr["body"],
+            "state": "open",
+            "state_reason": None,
+            "user": pr["user"],
+            "author_association": pr["author_association"],
+            "assignees": [],
+            "labels": [],
+            "pull_request": {"url": f"https://api.github.com/{API}/pulls/{pr['number']}"},
         }
 
     def by_id(self, issue_id):
@@ -142,6 +183,63 @@ class FakeGitHub:
         if handler is None:
             raise AssertionError(f"Unexpected gh call: {args}")
         return handler
+
+    def _request_page_size(self, args):
+        """Items per page for this request: the `page_size` override, else GitHub's rule
+        (`per_page` from the endpoint's query string, default 30, capped at 100). Only the
+        endpoint path counts, not a `--jq` filter or a field value that happens to contain it."""
+        if self.page_size is not None:
+            return self.page_size
+        path = next((arg for arg in args[1:] if arg.startswith("repos/")), "")
+        match = re.search(r"[?&]per_page=(\d+)", path)
+        if match:
+            return max(1, min(int(match.group(1)), 100))
+        return 30
+
+    def _emit(self, args, data, listing=False):
+        """Print `data` like `gh api` does, running a `--jq` filter through the real jq.
+
+        `listing` marks a collection endpoint. GitHub returns one page of at most `per_page`
+        items per request (30 by default, 100 at most; see `_request_page_size`), so a listing
+        read without `--paginate` would be silently truncated in production; the fake fails
+        loudly instead. With `--paginate`, gh runs a `--jq` filter
+        once per page and concatenates the outputs; `--slurp` wraps all pages in one more array.
+        Like gh, strings come out raw and other values as compact JSON.
+        """
+        jq = self._option(args, "--jq")
+        paginate = "--paginate" in args
+        if "--slurp" in args and not paginate:
+            raise AssertionError(f"gh: `--paginate` required when passing `--slurp`: {args}")
+        if "--slurp" in args and jq is not None:
+            raise AssertionError(
+                f"gh: the `--slurp` option is not supported with `--jq` or `--template`: {args}")
+        size = self._request_page_size(args) if listing else None
+        if listing and not paginate:
+            raise AssertionError(
+                f"Listing read without `--paginate` (GitHub returns one page of at most "
+                f"{size} items): {args}")
+        if listing:
+            pages = [data[start:start + size] for start in range(0, len(data), size)] or [[]]
+        else:
+            pages = [data]
+        documents = [pages] if "--slurp" in args else pages
+        if jq is None:
+            return self._result(stdout="".join(json.dumps(doc) + "\n" for doc in documents))
+        binary = shutil.which("jq")
+        if binary is None:
+            raise AssertionError("fake_github needs the `jq` binary to apply --jq filters")
+        out = ""
+        for doc in documents:
+            run = subprocess.run([binary, "-c", "-r", jq], input=json.dumps(doc), capture_output=True,
+                                 text=True, check=False)
+            if run.returncode == 3:
+                # A filter that does not compile is a bug in the caller, not a failed request.
+                raise AssertionError(f"jq filter does not compile: {jq!r}: {run.stderr.strip()}")
+            if run.returncode != 0:
+                return self._result(1, stderr=f"jq failed: {run.stderr}", args=args,
+                                    check=self._check)
+            out += run.stdout
+        return self._result(stdout=out)
 
     def _result(self, returncode=0, stdout="", stderr="", check=True, args=()):
         if check and returncode != 0:
@@ -224,7 +322,7 @@ class FakeGitHub:
         path = next(arg for arg in args[1:] if arg.startswith(("repos/", "user", "graphql")))
         fields = self._fields(args)
         if path == "user":
-            return self._result(stdout=self.login + "\n")
+            return self._emit(args, {"login": self.login})
         if path == "graphql":
             query = fields.get("query", "")
             if "addProjectV2ItemById" in query:
@@ -312,67 +410,59 @@ class FakeGitHub:
             data = {"data": {"repository": {"issue": {"projectItems": {"nodes": nodes}}}}}
             return self._result(stdout=json.dumps(data))
         if re.match(rf"{API}/branches\?", path):
-            if "--slurp" in args:
-                return self._result(stdout=json.dumps([[{"name": n} for n in self.branches]]))
-            return self._result(stdout="".join(f"{name}\n" for name in self.branches))
-        pull_list = re.match(rf"{API}/pulls\?state=open", path)
-        if pull_list:
-            if "--slurp" in args:
-                return self._result(stdout=json.dumps([[
-                    {key: pr[key] for key in ("number", "title", "body", "head",
-                                              "author_association")}
-                    for pr in self.pull_requests.values()
-                ]]))
-            return self._result(
-                stdout="".join(json.dumps({key: pr[key] for key in (
-                    "number", "title", "body", "head", "author_association")}) + "\n"
-                               for pr in self.pull_requests.values())
-            )
+            branches = [{"name": name} for name in self.branches]
+            return self._emit(args, branches, listing=True)
+        if re.match(rf"{API}/pulls\?state=open", path):
+            pulls = [{key: pr[key] for key in ("number", "title", "body", "head",
+                                               "author_association", "user")}
+                     for pr in self.pull_requests.values()]
+            return self._emit(args, pulls, listing=True)
         if path.startswith(f"{API}/issues?state=all"):
-            lines = [json.dumps({key: issue[key] for key in (
-                "number", "id", "node_id", "title", "body", "state", "state_reason", "assignees",
-                "labels", "author", "author_association")}
-                | {"parent": None}) for issue in self.issues.values()]
-            return self._result(stdout="\n".join(lines) + ("\n" if lines else ""))
+            # The real endpoint lists pull requests too, marked by a `pull_request` key.
+            listing = [self.raw_issue(issue) for issue in self.issues.values()]
+            listing += [self.raw_pull_request(pr) for pr in self.pull_requests.values()]
+            listing.sort(key=lambda item: item["number"])
+            return self._emit(args, listing, listing=True)
         match = re.match(rf"{API}/issues/(\d+)(/.*)?$", path)
         if not match:
             return None
-        number, rest = int(match.group(1)), match.group(2) or ""
+        number = int(match.group(1))
+        # Route sub-paths (`/parent`, `/comments`, ...) without their query string, so
+        # `?per_page=100` does not change the route. A bare `/issues/N?...` still fails above.
+        rest = (match.group(2) or "").split("?", 1)[0]
         if rest == "/parent":
             if number in self.parents:
-                return self._result(stdout=f"{self.parents[number]}\n")
+                return self._emit(args, self.raw_issue(self.issues[self.parents[number]]))
             return self._result(1, stderr="gh: Not Found (HTTP 404)", check=False)
         if rest == "/sub_issues" and method == "POST":
             child = self.by_id(fields["sub_issue_id"])
-            if child["number"] in self.parents and fields.get("replace_parent") != "true":
-                return self._result(1, stderr="already has a parent (HTTP 422)", args=args)
+            if child["number"] in self.parents and fields.get("replace_parent") is not True:
+                return self._result(1, stderr="already has a parent (HTTP 422)", args=args,
+                                    check=self._check)
             self.parents[child["number"]] = number
             if self.auto_add_sub_issues and number in self.project_items:
                 self.pending_auto_adds.add(child["number"])
-            return self._result(stdout=f"{number}\n")
+            return self._emit(args, self.raw_issue(self.issues[number]))
         if rest == "/dependencies/blocked_by":
             if method == "POST":
                 blocker = self.by_id(fields["issue_id"])["number"]
                 self.blockers.setdefault(number, set()).add(blocker)
-                return self._result(stdout=f"{number}\n")
-            blockers = sorted(self.blockers.get(number, ()))
-            return self._result(stdout="".join(f"{n}\n" for n in blockers))
+                return self._emit(args, self.raw_issue(self.issues[number]))
+            blockers = [self.raw_issue(self.issues[n]) if n in self.issues else {"number": n}
+                        for n in sorted(self.blockers.get(number, ()))]
+            return self._emit(args, blockers, listing=True)
         if rest.startswith("/dependencies/blocked_by/") and method == "DELETE":
             self.blockers.get(number, set()).discard(self.by_id(rest.rsplit("/", 1)[1])["number"])
             return self._result(stdout="")
         if rest.startswith("/comments") and method == "GET":
-            comments = self.comments.get(number, [])
-            return self._result(
-                stdout="".join(json.dumps({"body": body}) + "\n" for body in comments)
-            )
+            comments = [{"id": index + 1, "body": body}
+                        for index, body in enumerate(self.comments.get(number, []))]
+            return self._emit(args, comments, listing=True)
         if rest == "/comments" and method == "POST":
             self.comments.setdefault(number, []).append(fields["body"])
-            return self._result(stdout="1\n")
+            return self._emit(args, {"id": len(self.comments[number]), "body": fields["body"]})
         if rest == "" and method == "GET":
-            issue = self.issues[number]
-            return self._result(stdout=json.dumps(
-                {key: issue[key] for key in ("number", "title", "body", "state", "state_reason")}
-                | {"labels": [{"name": name} for name in issue["labels"]]}))
+            return self._emit(args, self.raw_issue(self.issues[number]))
         if rest == "" and method == "PATCH":
             issue = self.issues[number]
             for key in ("title", "body", "state", "state_reason"):
@@ -380,5 +470,5 @@ class FakeGitHub:
                     issue[key] = fields[key]
             if fields.get("state") == "open":
                 issue["state_reason"] = None
-            return self._result(stdout=f"{number}\n")
+            return self._emit(args, self.raw_issue(issue))
         return None

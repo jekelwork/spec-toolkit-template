@@ -43,6 +43,16 @@ class SpecPlanBodyTest(unittest.TestCase):
         self.assertLess(steps.index("`speckit-clarify`"), steps.index("`speckit-plan`"))
         self.assertIn("Do not run `speckit-tasks` on this branch", body)
 
+    def test_merge_line_does_not_claim_automatic_unblocking(self):
+        body = roadmap_issues.spec_plan_body({"id": "008", "title": "Example"}, "specs/008-example")
+        text = " ".join(body.split())
+        self.assertIn(
+            "Merging closes this issue; Phase 1 is unblocked by the next manual roadmap sync "
+            "run with **Apply changes** selected.",
+            text,
+        )
+        self.assertNotIn("and unblocks Phase 1", text)
+
 
 SECTION = "# Roadmap\n\n## Planned Specs\n\n"
 
@@ -134,18 +144,20 @@ class RoadmapIssueSyncTest(unittest.TestCase):
         self.assertEqual(issue["state_reason"], "completed")
 
     def test_board_workflows_use_configured_owner_and_scoped_token(self):
-        workflows = Path(__file__).parent.parent / ".github/workflows"
-        for name in ("sync-roadmap-issues.yml", "sync-spec-tasks.yml"):
+        root = Path(__file__).parent.parent / ".github"
+        action = (root / "actions/board-token/action.yml").read_text(encoding="utf-8")
+        self.assertIn("owner: ${{ steps.project-config.outputs.owner }}", action)
+        self.assertNotRegex(action, r"owner: (?!\$\{\{)")
+        self.assertIn("permission-issues: read", action)
+        self.assertIn("permission-organization-projects: write", action)
+        self.assertIn("--repository-owner", action)
+        self.assertIn("repositories: ${{ steps.repo.outputs.name }}", action)
+        for name in ("sync-roadmap-issues.yml", "sync-phase-issues.yml"):
             with self.subTest(workflow=name):
-                content = (workflows / name).read_text(encoding="utf-8")
-                self.assertIn("owner: ${{ steps.project-config.outputs.owner }}", content)
-                self.assertNotRegex(content, r"owner: (?!\$\{\{)")
-                self.assertIn("permission-issues: read", content)
-                self.assertIn("permission-organization-projects: write", content)
+                content = (root / "workflows" / name).read_text(encoding="utf-8")
+                self.assertIn("uses: ./.github/actions/board-token", content)
                 self.assertIn("secrets.PROJECT_STATUS_APP_ID", content)
                 self.assertIn("secrets.PROJECT_BOARD_APP_PRIVATE_KEY", content)
-                self.assertIn("--repository-owner", content)
-                self.assertIn("repositories: ${{ steps.repo.outputs.name }}", content)
 
     def test_read_only_roadmap_previews_use_separate_concurrency_group(self):
         workflow = (
@@ -247,6 +259,35 @@ class RoadmapIssueSyncTest(unittest.TestCase):
         self.assertEqual({self.find(roadmap_issues.roadmap_marker("901"))["number"]},
                          self.fake.blockers[epic["number"]])
 
+    def test_provisional_phase_1_body_describes_manual_apply_only(self):
+        self.run_sync("--apply")
+        body = self.phase1()["body"]
+        self.assertNotIn("automatic apply", body)
+        self.assertNotIn("dry-run rollout", body)
+        self.assertIn(
+            "The sync removes the blocker only in a manual run of the roadmap sync workflow "
+            "with **Apply changes** selected; push and daily runs only preview.",
+            " ".join(body.split()),
+        )
+
+    def test_existing_provisional_phase_1_with_old_body_is_updated_only_on_apply(self):
+        self.run_sync("--id", "900", "--apply")
+        phase1 = self.phase1()
+        old_body = phase1["body"].replace(
+            "The sync removes the blocker only in a manual run",
+            "The blocker is removed automatically after a run",
+        )
+        phase1["body"] = old_body
+
+        result, output = self.run_sync("--id", "900")
+        self.assertEqual(0, result)
+        self.assertIn(f"update #{phase1['number']} (provisional Phase 1)", output)
+        self.assertEqual(old_body, phase1["body"])
+
+        self.run_sync("--id", "900", "--apply")
+        self.assertNotEqual(old_body, phase1["body"])
+        self.assertIn("The sync removes the blocker only in a manual run", phase1["body"])
+
     def test_sync_renders_wrapped_fields_and_updates_existing_epic_body(self):
         self.write_roadmap(WRAPPED_ENTRY)
         self.run_sync("--apply")
@@ -260,6 +301,18 @@ class RoadmapIssueSyncTest(unittest.TestCase):
         epic = self.find(roadmap_issues.roadmap_marker("910"))
         self.assertIn("- **Notes:** Note start revised ending.", epic["body"])
         self.assertNotIn("note end.", epic["body"])
+
+    def test_existing_epic_with_old_completion_wording_is_rewritten_on_apply(self):
+        self.run_sync("--id", "900", "--apply")
+        epic = self.find(roadmap_issues.roadmap_marker("900"))
+        epic["body"] = epic["body"].replace("The Phase sync closes", "The task sync closes")
+        self.assertIn("The task sync closes this epic", epic["body"])
+
+        self.run_sync("--id", "900", "--apply")
+
+        epic = self.find(roadmap_issues.roadmap_marker("900"))
+        self.assertIn("The Phase sync closes this epic", epic["body"])
+        self.assertNotIn("task sync", epic["body"])
 
     def test_renamed_roadmap_entry_keeps_the_provisional_phase_1_issue(self):
         self.run_sync("--id", "900", "--apply")

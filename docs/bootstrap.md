@@ -27,8 +27,8 @@ action. It changes nothing, so run it whenever you are unsure.
   Enterprise). On GitHub Free, rulesets work only on public repositories.
 - Optional: your choice of coding agents. `start` asks which coding agents you use (Claude Code,
   GitHub Copilot, Codex) once, when no choice is saved, and generates only their sub-agent files.
-  Enter saves all three; with `--no-input` nothing is asked. Run `npm run setup-agents` again whenever you change
-  coding agents, to generate the files for the new ones.
+  Enter saves all three; with `--no-input` nothing is asked. Run `npm run setup-agents` again
+  whenever you change coding agents, to generate the files for the new ones.
 
 ## Quick start
 
@@ -68,15 +68,16 @@ and the guided path does the same things.
 creates your repository with the template's files as a single initial commit on `main`, with a fresh
 history. GitHub copies files only: labels, the ruleset, secrets and the board are set up by the
 bootstrap steps below. If the clone comes out empty because GitHub was still generating the
-repository, run `git fetch origin && git checkout main` in it. `npm ci` runs the `prepare` script, which installs the Git
-hooks and runs `python3 scripts/agent_setup.py sync` to generate the sub-agent files for Copilot,
-Claude Code and Codex (`npm run setup-agents` is the interactive way to limit them to the tools you use). Run it in
-the clone, because the hooks need a Git repository. Restart your coding agent session afterwards so it
-loads the agents. Git does not regenerate the agent files on checkout, pull or rebase: run
-`python3 scripts/agent_setup.py sync` after switching branches (`bootstrap.py check` reports out-of-date agent
-files). When you review an untrusted pull request, do not run its code or install its dependencies;
-review it on GitHub, or locally with `git -c core.hooksPath=/dev/null`. Lefthook reads `lefthook.yml`
-from the working tree whenever any hook runs, so use `git -c core.hooksPath=/dev/null` for checkouts
+repository, run `git fetch origin && git checkout main` in it. `npm ci` runs the `prepare` script,
+which installs the Git hooks and runs `python3 scripts/agent_setup.py sync` to generate the
+sub-agent files for Copilot, Claude Code and Codex (`npm run setup-agents` is the interactive way
+to limit them to the tools you use). Run it in the clone, because the hooks need a Git repository.
+Restart your coding agent session afterwards so it loads the agents. Git does not regenerate the
+agent files on checkout, pull or rebase: run `python3 scripts/agent_setup.py sync` after switching
+branches (`bootstrap.py check` reports out-of-date agent files). When you review an untrusted pull
+request, do not run its code or install its dependencies; review it on GitHub, or locally with
+`git -c core.hooksPath=/dev/null`. Lefthook reads `lefthook.yml` from the working tree whenever
+any hook runs, so use `git -c core.hooksPath=/dev/null` for checkouts
 and commits on untrusted branches. Older clones may still have the removed `post-checkout`,
 `post-merge` and `post-rewrite` hooks, which run the checked-out branch's `lefthook.yml`: remove them
 with `rm -f .git/hooks/post-checkout .git/hooks/post-merge .git/hooks/post-rewrite`
@@ -104,8 +105,8 @@ python3 scripts/bootstrap.py init --description "What the project does" --create
 `init` takes the owner and project name from the `origin` remote and prompts for the rest in a
 terminal; without one, or with `--yes`, it names the flag for any missing value. The board is
 `--project-number N` for an existing one or `--create-board` for a new empty one. Other flags:
-`--name`, `--owner`, `--required-approvals` (default 0), `--force` (overwrite). The result is validated before it
-is written:
+`--name`, `--owner`, `--required-approvals` (default 0), `--force` (overwrite). The result is
+validated before it is written:
 
 ```toml
 [project]
@@ -234,9 +235,10 @@ request linked to issue" and set Status to `In review`. The command prints this 
 linked to issue" is enabled with Status = In review; set it if not.`). `github --apply` prints it
 after `Applied N change(s).`; `--check` and a preview with nothing to change also print it; a
 preview with changes leaves it out, because a new board has no `In review` option before the
-apply. `start` leaves it out of its preview and prints it after `Done: github_settings: …`. A new board turns this workflow on with Status `In progress`, and `check` can only see whether it
-is on, not which Status it sets, so check the Status yourself even when `check` reports the
-workflow as on.
+apply. `start` leaves it out of its preview and prints it after `Done: github_settings: …`. A new
+board turns this workflow on with Status `In progress`, and `check` can only see whether it is on,
+not which Status it sets, so check the Status yourself even when `check` reports the workflow as
+on.
 That built-in workflow reacts to pull requests linked to an issue (a closing keyword or a manual
 link); Phase pull requests carry only `Part of #<phase issue>`, so the toolkit's own
 `sync-project-status` workflow moves a Phase to `In review` from the open pull request on its Phase
@@ -245,7 +247,7 @@ branch, and the setting matters for other issues.
 ## Board credentials
 
 No token is required. The workflows that update the GitHub Project board (`sync-roadmap-issues`,
-`sync-spec-tasks`, `sync-project-status`) work without a board credential: board sync is skipped with
+`sync-phase-issues`, `sync-project-status`) work without a board credential: board sync is skipped with
 a notice and issues are still synced. To enable board sync, configure one of the two credentials
 below. Issue writes always use the workflow's own `GITHUB_TOKEN`; the board credential is used only
 for the board. The board owner (`github_project.owner`) must match the repository owner for both
@@ -253,7 +255,7 @@ credentials (case-insensitive). On GitHub Free, organization secrets may not be 
 private repositories; repository secrets always work.
 
 The `*_APP_ID` secrets may hold the App's Client ID or its numeric App ID; the workflows pass the
-value to `actions/create-github-app-token` as `client-id`.
+value to `actions/create-github-app-token` as `client-id` (through the shared `.github/actions/board-token` action).
 
 Set every secret in a separate terminal window, or on the repository's Settings → Secrets and
 variables → Actions page. Never run `gh secret set` through a coding agent's shell or a prefix that
@@ -411,7 +413,17 @@ when a board credential is configured.
   constitution has the sections listed in [Constitution](#constitution). The review looks at the
   constitution without its Sync Impact Report comment, so the `pull_request` step removing that
   comment does not count as a change after the review.
-- **Code owners:** the toolkit ships no CODEOWNERS file. If you want code-owner reviews, add one and turn on "Require review from Code Owners" in the ruleset yourself; `bootstrap.py github` does not manage it.
+- **Bootstrap review exception:** to keep the first run short, the review findings of this pull
+  request are not handed to you to decide, for the bootstrap pull request only. The agent fixes the
+  review's Critical and Required findings itself through the skills (`speckit-constitution` and
+  `roadmap-write`), and in the first round also its Optional and Nit findings where feasible; a
+  second round fixes only Critical and Required findings and drops the rest, named as dropped. A
+  finding whose fix would change what the constitution or roadmap decides is still asked of you.
+  After the bootstrap, every finding is relayed to you again. The rule is in
+  [review-and-approvals.md](review-and-approvals.md#bootstrap-review-exception).
+- **Code owners:** the toolkit ships no CODEOWNERS file. If you want code-owner reviews, add one and
+  turn on "Require review from Code Owners" in the ruleset yourself; `bootstrap.py github` does not
+  manage it.
 
 ## How the syncs behave
 
@@ -421,10 +433,13 @@ skip board updates and still sync issues (`sync-project-status` skips entirely).
 | Workflow                                             | Runs on                                                                 | Preview or apply                                                                                                                      |
 | ---------------------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `sync-roadmap-issues` (Epics, Planning, Phase 1)     | Push to `main` changing the roadmap or specs; daily; manual             | Push and daily runs preview only. Manual runs preview unless **Apply changes** is checked.                                            |
-| `sync-spec-tasks` (Phase issues from `tasks.md`)     | A merged PR to `main`; daily; manual (optional `feature` input)         | A merged PR that changes `tasks.md` applies. Daily runs preview unless `PHASE_SYNC_AUTO_APPLY` is `true`. Manual runs need **Apply**. |
+| `sync-phase-issues` (Phase issues from `tasks.md`)     | A merged PR to `main`; daily; manual (optional `feature` input)         | A merged PR that changes `tasks.md` applies. Daily runs preview unless `PHASE_SYNC_AUTO_APPLY` is `true`. Manual runs need **Apply**. |
 | `sync-project-status` (board Status of Phase issues) | Phase branch and PR events; issue close, reopen or label; daily; manual | Always applies; changes the Status of existing Phase issues and takes retired Phases off the board; it creates and closes no issues.  |
 
-- **Retired Phases leave the board.** A Phase removed from `tasks.md` is closed as not planned and its card is taken off the Project (removed again by any later run if it is still there); the issue stays closed as not planned. Closing a Phase as not planned by hand retires it too: the `issues: closed` event runs `sync-project-status`, which removes the card right away.
+- **Retired Phases leave the board.** A Phase removed from `tasks.md` is closed as not planned and
+  its card is taken off the Project (removed again by any later run if it is still there); the
+  issue stays closed as not planned. Closing a Phase as not planned by hand retires it too: the
+  `issues: closed` event runs `sync-project-status`, which removes the card right away.
 - **The first roadmap sync is a manual, reviewed step.** After the bootstrap pull request merges, run
   `gh workflow run sync-roadmap-issues.yml -f apply=false`, read the log, and only then run it with
   `-f apply=true` (or use the Actions tab). Until then Phase syncs find no Epic, preview with a
@@ -449,10 +464,13 @@ skip board updates and still sync issues (`sync-project-status` skips entirely).
 If the roadmap has no planned entry yet, add one (`roadmap-write`) and merge it. Run the first sync,
 then start from the entry's `SPEC: <ID> Create and approve spec and plan` issue. The step order is
 specify → clarify → plan → tasks → analyze → implement, enforced by the hooks in
-`.specify/extensions.yml`; before `speckit-specify`, set `SPECIFY_FEATURE_DIRECTORY=specs/<id>-<slug>`
-so it matches the roadmap entry. The spec and plan merge in their own pull request; `tasks.md` is
-generated afterwards on the Phase 1 implementation branch. See [AGENTS.md](../AGENTS.md) for the rules
-agents follow and the [README](../README.md#spec-kit-workflow-best-practices) for the whole flow.
+`.specify/extensions.yml`. In your coding agent, run `/speckit-specify` for the entry on its SPEC
+issue branch (`$speckit-specify` in Codex): your agent derives
+`SPECIFY_FEATURE_DIRECTORY=specs/<id>-<slug>` from the roadmap entry, so the directory prefix
+matches it, and you do not set it or run the entry check yourself. The spec and plan merge in their
+own pull request; `tasks.md` is generated afterwards on the Phase 1 implementation branch. See
+[AGENTS.md](../AGENTS.md) for the rules agents follow and the
+[Spec-driven workflow](spec-workflow.md#spec-kit-workflow-best-practices) for the whole flow.
 
 ## Your application's CI
 
@@ -489,9 +507,11 @@ It acts on five steps, each after a preview:
 - `bootstrap_issue`: checks out the issue's branch (after `git fetch origin <branch>` when it is only
   on GitHub), or runs `gh issue develop`, or first `gh issue create` (see
   [Bootstrap issue](#bootstrap-issue)). Uncommitted bootstrap files carry over to the branch and the
-  preview lists them; any other uncommitted file stops the step, and so does an `origin` that is
-  not a GitHub repository or names another one than the one `gh` uses (see
-  [Which repository `start` uses](#which-repository-start-uses)).
+  preview lists them. Untracked files do not stop the step: they are listed in the preview,
+  carried over to the branch and not committed. A changed tracked file outside the bootstrap files
+  stops it, with the action `Commit, stash or revert the changes to <paths>, then run start again.`
+  An `origin` that is not a GitHub repository or names another one than the one `gh` uses stops
+  it too (see [Which repository `start` uses](#which-repository-start-uses)).
 - `project_context`: runs `init` for a missing `project-context.toml`; with `--create-board` it also
   creates the board.
 - `github_settings`: runs `github --apply`.
@@ -510,7 +530,7 @@ It acts on five steps, each after a preview:
   - `origin` or any of its push URLs is not a GitHub repository, or names another one than the one
     `gh` uses (see [Which repository `start` uses](#which-repository-start-uses)).
 - `first_sync`: dispatches the first roadmap sync with `apply=true` and follows the run by polling it. It
-  stops unless `ROADMAP.md`, `specs/`, `scripts/`, `.github/workflows/`, `project-context.toml` and
+  stops unless `ROADMAP.md`, `specs/`, `scripts/`, `.github/workflows/`, `.github/actions/`, `project-context.toml` and
   `.specify/memory/constitution.md` are committed.
 
 `bootstrap_issue`, `pull_request` and `first_sync` are `performable: false` in `check --json`
@@ -527,12 +547,20 @@ names the branch check accepts), counts as a bootstrap branch.
 
 ### Terminal, `--no-input` and exit codes
 
-`start` prints progress lines on stderr while it works (`Reading the repository and GitHub state…`,
-one line per action, and for the first sync the run's number and link and
-`Still running (<m> min <s> s)…`), so a slow step never looks stuck. After it performs a step it
-prints `Done: <step>: <result>.`. When bootstrap is complete, the last line, after a blank line, is
-`BOOTSTRAP IS COMPLETE` or `BOOTSTRAP IS COMPLETE; MANUAL SETTINGS REMAIN (SEE ABOVE)`; it is bold
-only on a terminal with `NO_COLOR` unset or empty.
+`start` prints progress lines on stdout while it works
+(`Reading the repository and GitHub state…`, one line per action, and for the first sync the run's
+number and link and `Still running (<m> min <s> s)…`, at least every 30 seconds because each
+`gh run view` is cut off in time), so a slow step never looks stuck. Everything that is not an
+error goes to stdout, so a successful run never shows red in a tool that colours stderr; stderr
+carries only errors (a failed step, a usage error, a failed sync). After it performs a step it
+prints `Done: <step>: <result>.`. After `Done: github_settings: …` and the manual board line it
+prints the optional `board_credential` step once, with its link to
+[Board credentials](#board-credentials), when the credential is not done. It does not print it
+again on later runs, and not when `github_settings` was done earlier (for example by hand with
+`github --apply`); `check` still reports it, and the `github_settings` preview leaves its line out
+(`github` itself still prints it). When bootstrap is complete, the last line, after a blank line,
+is `BOOTSTRAP IS COMPLETE` or `BOOTSTRAP IS COMPLETE; MANUAL SETTINGS REMAIN (SEE ABOVE)`; it is
+bold only on a terminal with `NO_COLOR` unset or empty.
 
 In a terminal, `start` goes through the steps from the first unfinished one. At each of the five
 steps it prints the preview, a line naming the step (a fixed label such as
@@ -541,12 +569,13 @@ steps it prints the preview, a line naming the step (a fixed label such as
 Input typed before the prompt appears is discarded, so an answer is always one given after the
 preview was shown. After your yes it reads the state and the preview again. It stops with exit 4
 when either changed while the prompt waited, ends with exit 0 when bootstrap became complete
-meanwhile, and with exit 1 when the step can no longer be done or a stop applies. A step that is not done and does not block
-(an optional board credential, a manual setting) is printed with its action, and `start`
-continues. At any other step it does not perform (`prerequisites`, the constitution, the roadmap,
-the merge, an invalid `project-context.toml`) it stops with exit 1 and prints the action, its
-command and the documentation anchor. A stop that a step finds for itself (for example a checkout
-that has to be updated first) prints a title, what to do and the command, but no anchor.
+meanwhile, and with exit 1 when the step can no longer be done or a stop applies. A step that is
+not done and does not block (an optional board credential, a manual setting) is printed with its
+action, and `start` continues. At any other step it does not perform (`prerequisites`, the
+constitution, the roadmap, the merge, an invalid `project-context.toml`) it stops with exit 1 and
+prints the action, its command and the documentation anchor. A stop that a step finds for itself
+(for example a checkout that has to be updated first) prints a title, what to do and the command,
+but no anchor.
 
 Without a terminal, or with `--no-input`, it never prompts. At the first step that needs a
 confirmation it prints a blank line, `Next step (not done yet): <step>` and the preview. At exit 3
@@ -558,14 +587,14 @@ issue the label reads `Confirm "Use bootstrap issue #12":` and the command is pr
 candidate. Pass `--no-input` from a coding agent or script even if it runs in a pseudo-terminal,
 where the prompt could otherwise wait or be answered by the tool itself.
 
-At `project_context` without a terminal, missing `init` flags are decisions only you can make: `start`
-prints `Next step project_context needs your decisions: <flags>`, then `To give them, run:` and a
-command with placeholders, and exits 1 (nothing is wrong). The decisions line lists missing or
+At `project_context` without a terminal, missing `init` flags are decisions only you can make:
+`start` prints `Next step project_context needs your decisions: <flags>`, then `To give them, run:`
+and a command with placeholders, and exits 1 (nothing is wrong). The decisions line lists missing or
 invalid flags: when at least one required flag is missing, a given flag whose value fails
 validation is listed too, with one `<flag>: <validation message>` line each (never the value).
-With no flag missing, an invalid value exits 2 naming the flag and the validation message on stderr, never the value (exit 2 only when no flag
-is missing). With `--confirm`, the same missing or invalid flags exit 2 with a `needs:` line on
-stderr.
+With no flag missing, an invalid value exits 2 naming the flag and the validation message on
+stderr, never the value. With `--confirm`, the same missing or invalid flags exit 2 with a `needs:`
+line on stderr.
 
 With `--guided` (it requires `--confirm`, and exits 2 before reading anything without it) `start`
 performs only the confirmed step, prints `Done: <step>: <result>.` and
@@ -579,8 +608,11 @@ coding agents without asking. It saves it as `agent-setup.tools` in your local G
 the sub-agent files for those tools (this also removes the generated agent files of the tools not
 chosen; they come back if you choose them later with `npm run setup-agents`) and prints
 `Coding agents: <tools> (saved in git config agent-setup.tools).` and a line saying to run
-`npm run setup-agents` again whenever you change coding agents, then continues with the steps as
-usual. Without the flag, a terminal run that is not `--guided` and finds no saved choice asks
+`npm run setup-agents` again whenever you change coding agents. Without `--confirm` (without a
+terminal or with `--no-input`) it then prints
+`Go back to your coding agent and tell it the choice is saved.`, ends with exit 0 and does not
+preview the next step; with `--confirm` it continues with the steps as usual. Without the flag, a
+terminal run that is not `--guided` and finds no saved choice asks
 `Which coding agents do you use?` after its first state read (Enter saves all three); with
 `--no-input` and no `--agents`, nothing is asked or saved. There is no preview or confirmation,
 because it writes local Git config and git-ignored files only, and the previews and digests of the
@@ -611,14 +643,16 @@ python3 scripts/bootstrap.py start --no-input --confirm <step-id>@<digest> [--is
 ```
 
 `--guided` makes the command do only the confirmed step and end by telling you to go back to your
-coding agent; it requires `--confirm`.
+coding agent; it requires `--confirm`. When the preview was made with `--full-dry-run`, the
+confirming command that `start` prints carries it too.
 
 `--confirm` takes the value of the `confirm:` line of a preview. The digest is the first 12 hex
 characters of a SHA-256 over the step (for `bootstrap_issue` also the chosen issue number, or
 `new`), the preview text, the content of the files the step will commit, the local `HEAD`, the
 default branch's tip on GitHub, and the head of the open pull request or the bootstrap branch's
-tip. A confirmation therefore only acts when the state still matches the preview that produced the
-digest; it does not show that anyone saw it. A file, a flag value, a commit, a branch tip or the
+tip; for `first_sync` it covers the full dry run, with or without `--full-dry-run`. A confirmation
+therefore only acts when the state still matches the preview that produced the digest; it does
+not show that anyone saw it. A file, a flag value, a commit, a branch tip or the
 target repository that changed since then gives exit 4. After the confirmed step `start`
 continues as without `--confirm`, so without a terminal or with `--no-input` the next confirmation
 exits 3 again.
@@ -633,13 +667,13 @@ is reached:
    step checks first: for `github_settings` after the merge, a local `project-context.toml` that
    differs from the default branch's (parsed values; comments and spacing do not count) or is
    missing, with the hint `git switch <default> && git pull --ff-only origin <default>` (with
-   `git fetch origin <branch> && ` before a `git switch` to a branch that is only on GitHub); for `pull_request`, the
-   stops listed [above](#guided-path-with-start) (no bootstrap branch, a merge conflict or deleted
-   bootstrap file, a branch that is behind, not the pull request's head or missing its commits, and
-   an `origin` that does not match); for `first_sync`, see below.
-5. For `project_context`, an `init` flag is missing: exit 2, with a `needs:` line. This is checked in a terminal too,
-   because `--confirm` never prompts. Check 5b follows it: a given flag value that fails the
-   validation `init` uses (for example an empty `--description`) also exits 2.
+   `git fetch origin <branch> && ` before a `git switch` to a branch that is only on GitHub); for
+   `pull_request`, the stops listed [above](#guided-path-with-start) (no bootstrap branch, a merge
+   conflict or deleted bootstrap file, a branch that is behind, not the pull request's head or
+   missing its commits, and an `origin` that does not match); for `first_sync`, see below.
+5. For `project_context`, an `init` flag is missing: exit 2, with a `needs:` line. This is checked
+   in a terminal too, because `--confirm` never prompts. Check 5b follows it: a given flag value
+   that fails the validation `init` uses (for example an empty `--description`) also exits 2.
 6. For `bootstrap_issue`, the candidate: with several bootstrap issues and no `--issue`, or an
    `--issue` that is not one of them, `start` lists the candidates, each with its own `confirm:`
    line, and exits 3, also in a terminal. With no candidate, an `--issue N` is never ignored (that
@@ -651,15 +685,17 @@ is reached:
 
 `--description`, `--required-approvals` and `--project-number N` or `--create-board` are decisions,
 so `start` never fills them in with a default. Without a terminal a plain run, or the run after a
-confirmed step, stops with exit 1 and `Next step project_context needs your decisions`. `--owner` is also required when the repository has
-no GitHub `origin` remote to take it from. `--name` defaults to the repository's name, or to the
-checkout directory's name when there is no GitHub `origin` remote. Without a terminal, or with
-`--no-input` or `--confirm`, a missing flag is named before any preview (exit 1 with
-`To give them, run:` in a plain run, exit 2 with `--confirm`). `--name` and `--description` must be
-a single line: control characters, line and paragraph separators and bidi controls are rejected. In a terminal
-`start` asks for the missing values before the preview (for the approval count it offers 0, which
-you accept or change), so the preview shows everything that will be written. The same flags go to
-the preview run and to the confirming run; changing one in between gives exit 4.
+confirmed step, stops with exit 1 and `Next step project_context needs your decisions`. `--owner`
+is also required when the repository has no GitHub `origin` remote to take it from. `--name`
+defaults to the repository's name, or to the checkout directory's name when there is no GitHub
+`origin` remote. Without a terminal, or with `--no-input` or `--confirm`, a missing flag is named
+before any preview (exit 1 with `To give them, run:` in a plain run, exit 2 with `--confirm`).
+`--name` and `--description` must be a single line: control characters, line and paragraph
+separators and every other format character (Unicode category Cf, bidi controls included) are
+rejected; the zero-width joiner, the zero-width non-joiner and the soft hyphen stay valid. In a
+terminal `start` asks for the missing values before the preview (for the approval count it offers
+0, which you accept or change), so the preview shows everything that will be written. The same
+flags go to the preview run and to the confirming run; changing one in between gives exit 4.
 
 ### Which repository `start` uses
 
@@ -692,20 +728,26 @@ any issue, push, pull request or dispatch) when `origin` and the repository `gh`
 
 The guided and the manual path preview the first sync differently.
 
-- **Guided (`start`):** the preview is a local dry run of `python3 scripts/sync-roadmap-issues.py`,
-  printed in full before the prompt or before exit 3. It adds `--skip-project` when the board
-  credential is not done (not configured, incomplete, or could not be checked); when it could not
-  be checked at all, the preview also says that board changes are not previewed. A dry run that
-  fails offers no apply: `start` prints its output and exits 1. Before it, `start` stops (exit 1)
-  unless the checkout is exactly the default branch's tip with no uncommitted or untracked changes
-  in `ROADMAP.md`, `specs/`, `scripts/`, `.github/workflows/`, `project-context.toml` or
-  `.specify/memory/constitution.md` (the dispatched workflow runs what is on GitHub, so the local
-  dry run must read the same files), and unless the `origin` remote is a
-  GitHub URL for the same repository `gh` uses (see
+- **Guided (`start`):** the preview is a count summary of a local dry run of
+  `python3 scripts/sync-roadmap-issues.py`, printed before the prompt or before exit 3: how many
+  issues it will create (by kind, such as `Feature`, `SPEC` and `Phase 1`), sub-issue links, board
+  items and other changes. Lines that explain a block (for example a skipped item) are kept in
+  full. `start` with `--full-dry-run` adds the full dry run under the summary, and the flag is
+  carried in the confirming command that `start` prints. The digest is computed from the full dry
+  run, with or without the flag, so the same confirmation works for both and any change to the dry
+  run exits 4.
+  The dry run adds `--skip-project` when the board credential is not done (not configured,
+  incomplete, or could not be checked); when it could not be checked at all, the preview also says
+  that board changes are not previewed. A dry run that fails offers no apply: `start` prints its
+  output in full and exits 1. Before it, `start` stops (exit 1) unless the checkout is exactly the
+  default branch's tip with no uncommitted or untracked changes in `ROADMAP.md`, `specs/`,
+  `scripts/`, `.github/workflows/`, `.github/actions/`, `project-context.toml` or `.specify/memory/constitution.md`
+  (the dispatched workflow runs what is on GitHub, so the local dry run must read the same files),
+  and unless the `origin` remote is a GitHub URL for the same repository `gh` uses (see
   [Which repository `start` uses](#which-repository-start-uses)). The fix is printed:
-  `git switch <default> && git pull --ff-only origin <default>` for the checkout, and the commands in that section
-  for `origin`. The local dry run uses your shell environment (for example `BOARD_GH_TOKEN`), so
-  it can differ from the workflow run, which uses the repository's secrets.
+  `git switch <default> && git pull --ff-only origin <default>` for the checkout, and the commands
+  in that section for `origin`. The local dry run uses your shell environment (for example
+  `BOARD_GH_TOKEN`), so it can differ from the workflow run, which uses the repository's secrets.
 - **Manual:** run the workflow's preview, read the log, then apply, as in
   [How the syncs behave](#how-the-syncs-behave).
 
@@ -713,9 +755,11 @@ The confirmed apply runs `gh workflow run sync-roadmap-issues.yml -f apply=true`
 `start` lists the IDs of the sync's earlier manually dispatched runs of the logged-in user before
 the dispatch, then polls for up to 60 seconds for a run with a higher ID than any of those, so it
 never takes the push-triggered preview run and uses no clock comparison. It prints
-`Run <id>: <url>`, then polls `gh run view` and prints `Still running (<m> min <s> s)…` until the
-run ends. If the run does not appear, or you interrupt `start` after the dispatch, it says so and
-names the `gh run list` or `gh run watch` command; do not rerun `start` until the run has finished.
+`Run <id>: <url>`, then polls `gh run view` (each call is cut off so that a `gh` call that hangs
+counts as still running) and prints `Still running (<m> min <s> s)…` at least every 30 seconds
+until the run ends. If the run does not appear, or you interrupt `start` after the dispatch, it
+says so and names the `gh run list` or `gh run watch` command; do not rerun `start` until the run
+has finished.
 
 ### How far the confirmation can be trusted
 
@@ -768,7 +812,7 @@ expected: the guided path is for a repository created from the template.
 You can also be guided in a conversation. In your coding agent, ask it to bootstrap the project
 (for example "bootstrap this project" or "what is the next bootstrap step?"). The agent then uses
 the [`bootstrap-guide`](../.agents/skills/bootstrap-guide/SKILL.md) skill. It works with every
-coding agent the toolkit sets up (see [Coding agents](../README.md#coding-agents)). If the agent
+coding agent the toolkit sets up (see [Coding agents](coding-agents.md#coding-agents)). If the agent
 does not pick the skill from a free-text request, call it by name: `$bootstrap-guide` in Codex,
 `/bootstrap-guide` in Copilot and Claude Code.
 
@@ -817,6 +861,8 @@ the bootstrap pull request are yours too.
 The constitution and the roadmap do not need to be final. A first version is enough (one roadmap
 entry is fine): the constitution is versioned and can be amended, and `roadmap-write` changes the
 roadmap at any time. If you are unsure, ask either skill for a first draft and accept or edit it.
+The constitution step ends with a yes/no question about the version the skill wrote, with an offer
+to show the file; your yes is what makes it yours.
 
 ## Checking progress
 
@@ -849,6 +895,18 @@ removed or its meaning changes, or when a value is added to `state`, `actor` or 
 is added. Adding fields, `details` keys or values inside `details` does not raise it. Callers must
 ignore fields they do not know, and must stop when `format_version` is higher than the one they
 support.
+
+The report escapes the text that GitHub or the repository controls, so it can never be mistaken
+for something else when it is shown: in each step's `title`, in the action's `text`, in every string
+inside `details` and in `default_branch`, every control character, line or paragraph separator,
+invisible or bidirectional formatting character and lone surrogate is written as a Python escape
+(`\x1b`, `\u202e`), and every backslash is written as `\\`. Read `\x1b` as the characters
+it names; never turn it back into the character, and never put such text into a command. The same
+characters are escaped in the text that `check`, `start`, `github` and `init` print. A line feed inside a quoted value from GitHub, `gh` or git is shown as U+23CE (⏎), so the value stays on its line. A command is never
+escaped, because an escaped command would not run as shown: when a value in it contains such a
+character, `action.command` is `null` and `action.text` says that the command was left out; the
+user works it out by hand after checking the names. This does not change the meaning of any
+field, so `format_version` stays `1`.
 
 ### Example
 
@@ -991,5 +1049,5 @@ the reason in `title` and the fix in `action`, and `result` is `incomplete`.
 | Branch name rejected                                         | Use `<issue>-chore-<title>` (or `<issue>-phase-<n>-<title>`) from `gh issue develop`.              |
 | "Board sync skipped" notice                                  | No board credential or no `project-context.toml` yet; see [Board credentials](#board-credentials). |
 | Sub-agents not found or out of date                          | `python3 scripts/agent_setup.py sync`, then restart the agent session. |
-| Git hooks do not run                                         | See [Troubleshooting: hooks don't run](../README.md#troubleshooting-hooks-dont-run).               |
+| Git hooks do not run                                         | See [Troubleshooting: hooks don't run](local-setup.md#troubleshooting-hooks-dont-run).               |
 | **Repository tools** fails in `AgentsIndexTest` (`scripts/test_agents_index.py`) | The "Where to find what" table in `AGENTS.md` is checked on every pull request: it needs the header `Question \| Where to look`, 10 to 16 rows, links that resolve to existing files, and anchors that match a heading; code-span paths must exist and must not be excluded from the export. A broken row, link or heading is named in the failure message; a wrong header or row count is reported with the rule it breaks. Fix the row, or update the target when you rename a heading or move a file. |

@@ -73,13 +73,40 @@ class ProjectContextTest(unittest.TestCase):
 
     def test_name_and_description_reject_bidi_controls(self):
         for key in ("name", "description"):
-            for char in ("\U0000202a", "\U0000202e", "\U00002066", "\U00002069"):
+            for char in ("\U0000202a", "\U0000202e", "\U00002066", "\U00002069",
+                         "\U0000200e", "\U0000200f", "\U0000061c"):
                 with self.subTest(key=key, character=f"U+{ord(char):04X}"):
                     with self.assertRaises(ValueError) as raised:
                         self.parse_with(key, f"a{char}b")
                     self.assertEqual(
                         f"project.{key} must be a non-empty single-line string "
                         "without control characters", str(raised.exception))
+
+    def test_name_and_description_reject_every_other_format_character(self):
+        # Unicode category Cf, except ZWJ, ZWNJ and soft hyphen: zero-width space, word joiner,
+        # byte order mark, a tag character, invisible operators.
+        import project_context
+
+        for key in ("name", "description"):
+            for code in (0x200B, 0x2060, 0xFEFF, 0xE0041, 0xE0001, 0x2061, 0x180E):
+                with self.subTest(key=key, character=f"U+{code:04X}"):
+                    default = {"name": "Example", "description": "An example project"}[key]
+                    text = VALID.replace(f'{key} = "{default}"', f'{key} = "a\\U{code:08x}b"')
+                    with self.assertRaises(ValueError) as raised:
+                        project_context.parse_context(text)
+                    self.assertEqual(
+                        f"project.{key} must be a non-empty single-line string "
+                        "without control characters", str(raised.exception))
+
+    def test_name_and_description_keep_a_joiner_sequence_and_a_zero_width_non_joiner(self):
+        import project_context
+
+        for key in ("name", "description"):
+            text = "a" + chr(0x200C) + "b \U0001f468" + chr(0x200D) + "\U0001f469" + chr(0x200D) + "\U0001f467"
+            default = {"name": "Example", "description": "An example project"}[key]
+            parsed = project_context.parse_context(
+                VALID.replace(f'{key} = "{default}"', f'{key} = "{text}"'))
+            self.assertEqual(text, parsed["project"][key])
 
     def test_name_and_description_keep_zero_width_joiner_and_soft_hyphen(self):
         for key in ("name", "description"):
@@ -135,6 +162,9 @@ class ProjectContextTest(unittest.TestCase):
             scripts.mkdir()
             script = scripts / SCRIPT.name
             script.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+            # The leaf module the script imports from its own directory.
+            sibling = SCRIPT.with_name("display_text.py")
+            (scripts / sibling.name).write_text(sibling.read_text(encoding="utf-8"), encoding="utf-8")
             (Path(repository) / "project-context.toml").write_text(VALID, encoding="utf-8")
             result = subprocess.run(
                 [sys.executable, str(script)],

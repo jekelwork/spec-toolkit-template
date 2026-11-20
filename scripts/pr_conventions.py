@@ -315,7 +315,7 @@ def main() -> None:
             if errors:
                 raise ConventionError(
                     "Push rejected, branch name does not follow the conventions "
-                    "(see README 'Branch and pull request conventions'):\n"
+                    "(see docs/ci-and-conventions.md 'Branch and pull request conventions'):\n"
                     + "\n".join(f"  {error}" for error in errors)
                     + "\nRename the branch ('git branch -m <new-name>') or push it under "
                     "a valid name ('git push origin <local-branch>:<new-name>')."

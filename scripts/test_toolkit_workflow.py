@@ -15,17 +15,23 @@ ROADMAP_STEP_NAME = "Check the roadmap format once the repository is initialized
 
 
 def step_script(name, workflow=WORKFLOW):
-    """Return the `run` script of a step (plain text extraction, no YAML parser)."""
+    """Return the `run` script of a step (plain text extraction, no YAML parser).
+
+    Works for workflow steps (`      - name:`) and composite-action steps (`    - name:`).
+    """
     text = workflow.read_text(encoding="utf-8")
-    start = re.search(rf"^      - name: {re.escape(name)}\n", text, re.MULTILINE)
+    start = re.search(rf"^( *)- name: {re.escape(name)}\n", text, re.MULTILINE)
     if not start:
         raise AssertionError(f"step {name!r} not found in {workflow.name}")
-    following = re.search(r"^      - ", text[start.end() :], re.MULTILINE)
+    indent = len(start.group(1))
+    following = re.search(rf"^ {{{indent}}}- ", text[start.end() :], re.MULTILINE)
     body = text[start.end() : start.end() + following.start()] if following else text[start.end() :]
-    match = re.search(r"^        run: \|\n((?:(?: {10}.*)?\n)+)", body, re.MULTILINE)
+    match = re.search(
+        rf"^ {{{indent + 2}}}run: \|\n((?:(?: {{{indent + 4}}}.*)?\n)+)", body, re.MULTILINE
+    )
     if not match:
         raise AssertionError(f"step {name!r} has no run block in {workflow.name}")
-    return "\n".join(line[10:] for line in match.group(1).splitlines())
+    return "\n".join(line[indent + 4 :] for line in match.group(1).splitlines())
 
 
 class SourceOnlyExportToolingTest(unittest.TestCase):
@@ -38,45 +44,90 @@ class SourceOnlyExportToolingTest(unittest.TestCase):
         self.assertNotIn("--toolkit-export-source", text)
 
 
-APP_TOKEN_STEPS = (
-    ("sync-roadmap-issues.yml", "Create optional board token"),
-    ("sync-spec-tasks.yml", "Create optional board token"),
-    ("sync-project-status.yml", "Create project-scoped token"),
-)
+BOARD_ACTION = WORKFLOW.parent.parent / "actions/board-token/action.yml"
+BOARD_ACTION_USE = "uses: ./.github/actions/board-token"
+TOKEN_STEP = "Create optional board token"
+
+
+def action_text():
+    return BOARD_ACTION.read_text(encoding="utf-8")
+
+
+def action_step_block(name):
+    return action_text().split(f"- name: {name}\n")[1].split("\n    - ")[0]
+
+
+def action_step_condition(name):
+    return re.search(r"^      if: (.*)$", action_step_block(name), re.MULTILINE).group(1)
 
 
 class AppTokenRepositoryScopeTest(unittest.TestCase):
     """A schedule payload has no `repository`, so an App token must not be scoped through it."""
 
     def test_repositories_never_depends_on_the_event_repository(self):
-        for workflow, name in APP_TOKEN_STEPS:
-            with self.subTest(workflow=workflow):
-                block = step_block(workflow, name)
-                expression = re.search(r"^          repositories: (.*)$", block, re.MULTILINE).group(1)
-                self.assertNotIn("github.event.repository", expression)
-                # Non-empty even when the event has no repository.
-                self.assertEqual(
-                    evaluate(expression, {"steps.repo.outputs.name": "example-repo"}), "example-repo"
-                )
+        block = action_step_block(TOKEN_STEP)
+        expression = re.search(r"^        repositories: (.*)$", block, re.MULTILINE).group(1)
+        self.assertNotIn("github.event.repository", expression)
+        # Non-empty even when the event has no repository.
+        self.assertEqual(evaluate(expression, {"steps.repo.outputs.name": "example-repo"}), "example-repo")
 
     def test_the_repository_name_step_runs_first_and_strips_the_owner(self):
-        for workflow, name in APP_TOKEN_STEPS:
+        text = action_text()
+        self.assertLess(text.index("id: repo\n"), text.index(f"- name: {TOKEN_STEP}\n"))
+        script = step_script("Read the repository name", BOARD_ACTION)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "out"
+            subprocess.run(
+                ["bash", "-e", "-c", script],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "GITHUB_REPOSITORY": "example-org/example-repo",
+                    "GITHUB_OUTPUT": str(output),
+                },
+                check=True,
+            )
+            self.assertEqual(output.read_text(), "name=example-repo\n")
+
+
+class BoardActionUseTest(unittest.TestCase):
+    """The three board workflows share one local composite action, run after the trusted checkout."""
+
+    def test_every_board_workflow_uses_the_action_after_its_checkout(self):
+        for workflow in BOARD_WORKFLOWS:
             with self.subTest(workflow=workflow):
                 text = workflow_text(workflow)
-                self.assertLess(text.index("id: repo\n"), text.index(f"- name: {name}\n"))
-                script = step_script("Read the repository name", WORKFLOWS / workflow)
-                with tempfile.TemporaryDirectory() as directory:
-                    output = Path(directory) / "out"
-                    subprocess.run(
-                        ["bash", "-e", "-c", script],
-                        env={
-                            "PATH": "/usr/bin:/bin",
-                            "GITHUB_REPOSITORY": "example-org/example-repo",
-                            "GITHUB_OUTPUT": str(output),
-                        },
-                        check=True,
-                    )
-                    self.assertEqual(output.read_text(), "name=example-repo\n")
+                self.assertEqual(text.count(BOARD_ACTION_USE), 1)
+                self.assertLess(text.index("actions/checkout@"), text.index(BOARD_ACTION_USE))
+                step = step_block(workflow, BOARD_STEP)
+                self.assertIn("id: board\n", step)
+                self.assertIn("client-id: ${{ secrets.PROJECT_STATUS_APP_ID }}", step)
+                self.assertIn("private-key: ${{ secrets.PROJECT_BOARD_APP_PRIVATE_KEY }}", step)
+
+    def test_the_workflows_no_longer_repeat_the_shared_steps(self):
+        for workflow in BOARD_WORKFLOWS:
+            with self.subTest(workflow=workflow):
+                text = workflow_text(workflow)
+                for name in (OWNER_STEP, "Read the repository name", TOKEN_STEP):
+                    self.assertNotIn(f"- name: {name}\n", text)
+                self.assertNotIn("create-github-app-token", text)
+
+    def test_the_action_declares_the_owner_and_token_outputs_and_secret_inputs(self):
+        text = action_text()
+        self.assertIn("using: composite", text)
+        self.assertIn("value: ${{ steps.project-config.outputs.owner }}", text)
+        self.assertIn("value: ${{ steps.app-token.outputs.token }}", text)
+        for name in ("client-id", "private-key", "has-board-pat"):
+            self.assertRegex(text, rf"(?m)^  {name}:\n")
+        self.assertEqual(secret_interpolations_in_run(text), [])
+        self.assertNotIn("${{ secrets.", text)
+
+    def test_every_run_step_in_the_action_declares_shell_bash(self):
+        steps = re.split(r"(?m)^    - ", action_text().split("\nruns:\n")[1])[1:]
+        run_steps = [step for step in steps if re.search(r"(?m)^      run:", step)]
+        self.assertTrue(run_steps)
+        for step in run_steps:
+            with self.subTest(step=step.splitlines()[0]):
+                self.assertRegex(step, r"(?m)^      shell: bash$")
 
 
 class ToolkitWorkflowRoadmapStepTest(unittest.TestCase):
@@ -235,7 +286,8 @@ class TemplateStaysUninitializedStepTest(unittest.TestCase):
 
 WORKFLOWS = WORKFLOW.parent
 OWNER_STEP = "Read configured Project owner"
-ISSUE_SYNCS = ("sync-roadmap-issues.yml", "sync-spec-tasks.yml")
+BOARD_STEP = "Set up the board credential"
+ISSUE_SYNCS = ("sync-roadmap-issues.yml", "sync-phase-issues.yml")
 BOARD_WORKFLOWS = (*ISSUE_SYNCS, "sync-project-status.yml")
 
 
@@ -296,8 +348,8 @@ class SyncWorkflowHardeningTest(unittest.TestCase):
             "refs/heads/main",
         )
 
-    def test_the_task_sync_schedule_runs_on_the_default_branch(self):
-        text = workflow_text("sync-spec-tasks.yml")
+    def test_the_phase_sync_schedule_runs_on_the_default_branch(self):
+        text = workflow_text("sync-phase-issues.yml")
         condition = re.search(r"^    if: >-\n((?:      .*\n)+)", text, re.MULTILINE).group(1)
         context = {
             "github.event_name": "schedule",
@@ -311,22 +363,59 @@ class SyncWorkflowHardeningTest(unittest.TestCase):
     def test_issue_mutating_syncs_cannot_be_cancelled_by_skipped_runs(self):
         # Workflow-level concurrency is taken before the job `if`, so a skipped feature-branch run
         # could replace a pending default-branch run; keep it on the job.
-        for workflow in ("sync-roadmap-issues.yml", "sync-spec-tasks.yml"):
+        for workflow in ("sync-roadmap-issues.yml", "sync-phase-issues.yml"):
             with self.subTest(workflow=workflow):
                 text = workflow_text(workflow)
                 self.assertNotRegex(text.split("jobs:\n")[0], r"(?m)^concurrency:")
                 self.assertRegex(text.split("jobs:\n")[1], r"(?m)^    concurrency:")
 
     def test_the_feature_loop_does_not_word_split(self):
-        text = workflow_text("sync-spec-tasks.yml")
+        text = workflow_text("sync-phase-issues.yml")
         self.assertNotIn("for feature in $features", text)
         self.assertIn("while IFS= read -r feature", text)
 
 
-class BoardOwnerStepTest(unittest.TestCase):
-    """The three board workflows share one step; project_context.py decides skip, owner or failure."""
+class ProjectStatusTriggerTest(unittest.TestCase):
+    """Trigger and job condition of sync-project-status.yml (see the comment at the top of the workflow)."""
 
-    def run_step(self, workflow, stub):
+    def condition(self):
+        text = workflow_text("sync-project-status.yml").split("jobs:\n")[1]
+        match = re.search(r"^    if: >-\n((?:      .*\n)+)", text, re.MULTILINE)
+        self.assertIsNotNone(match)
+        return " ".join(match.group(1).split())
+
+    def runs(self, **overrides):
+        context = {
+            "github.event_name": "push",
+            "github.ref": "refs/heads/1-phase-1-x",
+            "github.event.repository.default_branch": "main",
+        }
+        context.update(overrides)
+        return bool(evaluate(self.condition(), context))
+
+    def test_create_trigger_is_absent(self):
+        head = workflow_text("sync-project-status.yml").split("jobs:\n")[0]
+        on_block = head.split("\non:\n")[1].split("\npermissions:")[0]
+        self.assertIn("  push:\n", on_block)
+        self.assertNotRegex(on_block, r"(?m)^  create:")
+
+    def test_the_create_event_is_not_handled(self):
+        text = workflow_text("sync-project-status.yml")
+        self.assertNotIn("EVENT_REF", text)
+        self.assertNotIn("ref_type", text)
+
+    def test_a_phase_branch_push_runs(self):
+        self.assertTrue(self.runs())
+
+    def test_workflow_dispatch_runs_only_on_the_default_branch(self):
+        self.assertTrue(self.runs(**{"github.event_name": "workflow_dispatch", "github.ref": "refs/heads/main"}))
+        self.assertFalse(self.runs(**{"github.event_name": "workflow_dispatch", "github.ref": "refs/heads/feature"}))
+
+
+class BoardOwnerStepTest(unittest.TestCase):
+    """The shared action step; project_context.py decides skip, owner or failure."""
+
+    def run_step(self, stub):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -334,7 +423,7 @@ class BoardOwnerStepTest(unittest.TestCase):
             output_file = root / "github-output"
             output_file.write_text("", encoding="utf-8")
             result = subprocess.run(
-                ["bash", "-e", "-c", step_script(OWNER_STEP, WORKFLOWS / workflow)],
+                ["bash", "-e", "-c", step_script(OWNER_STEP, BOARD_ACTION)],
                 cwd=directory,
                 capture_output=True,
                 text=True,
@@ -349,41 +438,29 @@ class BoardOwnerStepTest(unittest.TestCase):
 
     def test_the_owner_is_written_to_the_step_output(self):
         stub = "import sys\nprint(' '.join(sys.argv[1:]), file=sys.stderr)\nprint('example-org')\n"
-        for workflow in BOARD_WORKFLOWS:
-            with self.subTest(workflow=workflow):
-                result, output = self.run_step(workflow, stub)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(output, "owner=example-org\n")
-                self.assertIn("--board-owner-or-skip", result.stderr)
-                self.assertIn("--repository-owner example-org", result.stderr)
+        result, output = self.run_step(stub)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output, "owner=example-org\n")
+        self.assertIn("--board-owner-or-skip", result.stderr)
+        self.assertIn("--repository-owner example-org", result.stderr)
 
     def test_a_skip_leaves_the_owner_empty(self):
-        for workflow in BOARD_WORKFLOWS:
-            with self.subTest(workflow=workflow):
-                result, output = self.run_step(workflow, "pass\n")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(output, "owner=\n")
+        result, output = self.run_step("pass\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output, "owner=\n")
 
     def test_a_failure_fails_the_step_without_an_owner(self):
         stub = "import sys\nprint('::error::Missing project context', file=sys.stderr)\nsys.exit(1)\n"
-        for workflow in BOARD_WORKFLOWS:
-            with self.subTest(workflow=workflow):
-                result, output = self.run_step(workflow, stub)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertNotIn("owner=", output)
+        result, output = self.run_step(stub)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("owner=", output)
 
     def test_the_step_always_runs_and_the_later_board_steps_wait_for_the_owner(self):
-        for workflow in BOARD_WORKFLOWS:
-            with self.subTest(workflow=workflow):
-                self.assertNotIn("if:", step_block(workflow, OWNER_STEP))
-        for name in ("Create project-scoped token", "Reconcile statuses"):
-            self.assertIn(
-                "steps.project-config.outputs.owner != ''",
-                step_block("sync-project-status.yml", name),
-            )
-        for workflow in ISSUE_SYNCS:
-            token = step_block(workflow, "Create optional board token")
-            self.assertIn("steps.project-config.outputs.owner != ''", token)
+        self.assertNotIn("if:", action_step_block(OWNER_STEP))
+        self.assertIn("steps.project-config.outputs.owner != ''", action_step_block(TOKEN_STEP))
+        self.assertIn(
+            "steps.board.outputs.owner != ''", step_block("sync-project-status.yml", "Reconcile statuses")
+        )
 
     def test_the_duplicated_board_steps_are_gone(self):
         for workflow in BOARD_WORKFLOWS:
@@ -536,7 +613,7 @@ class UnbufferedSyncStepTest(unittest.TestCase):
     def test_python_sync_steps_print_unbuffered(self):
         for workflow, step in (
             ("sync-roadmap-issues.yml", "Synchronize roadmap issues"),
-            ("sync-spec-tasks.yml", "Synchronize Phase issues"),
+            ("sync-phase-issues.yml", "Synchronize Phase issues"),
             ("sync-project-status.yml", "Reconcile statuses"),
         ):
             with self.subTest(workflow=workflow):
@@ -558,14 +635,14 @@ class BoardCredentialTest(unittest.TestCase):
         )
         for workflow, step in (
             ("sync-roadmap-issues.yml", "Synchronize roadmap issues"),
-            ("sync-spec-tasks.yml", "Synchronize Phase issues"),
+            ("sync-phase-issues.yml", "Synchronize Phase issues"),
         ):
             expression = env_expression(workflow, step, "BOARD_GH_TOKEN")
             for app_token, owner, pat, expected in cases:
                 with self.subTest(workflow=workflow, app=app_token, owner=owner, pat=pat):
                     context = {
-                        "steps.board-token.outputs.token": app_token,
-                        "steps.project-config.outputs.owner": owner,
+                        "steps.board.outputs.token": app_token,
+                        "steps.board.outputs.owner": owner,
                         "secrets.PROJECT_BOARD_TOKEN": pat,
                     }
                     self.assertEqual(evaluate(expression, context), expected)
@@ -581,7 +658,7 @@ class BoardCredentialTest(unittest.TestCase):
         for app_token, pat, expected in cases:
             with self.subTest(app=app_token, pat=pat):
                 context = {
-                    "steps.app-token.outputs.token": app_token,
+                    "steps.board.outputs.token": app_token,
                     "secrets.PROJECT_BOARD_TOKEN": pat,
                 }
                 self.assertEqual(evaluate(expression, context), expected)
@@ -598,28 +675,47 @@ class BoardCredentialTest(unittest.TestCase):
         self.assertNotIn("write", permissions)
 
     def test_the_app_token_is_only_created_when_the_app_is_set(self):
-        for workflow, name in (
-            ("sync-roadmap-issues.yml", "Create optional board token"),
-            ("sync-spec-tasks.yml", "Create optional board token"),
-            ("sync-project-status.yml", "Create project-scoped token"),
+        condition = action_step_condition(TOKEN_STEP)
+        for client_id, key, runs in (
+            ("id", "key", True),
+            ("id", "", False),
+            ("", "key", False),
+            ("", "", False),
         ):
-            condition = step_condition(workflow, name)
-            for app, pat, runs in (
-                ("true", "false", True),
-                ("true", "true", True),
-                ("false", "true", False),
-                ("false", "false", False),
-            ):
-                with self.subTest(workflow=workflow, app=app, pat=pat):
-                    context = {
-                        "env.HAS_BOARD_APP": app,
-                        "env.HAS_BOARD_PAT": pat,
-                        "steps.project-config.outputs.owner": "example-org",
-                    }
-                    self.assertEqual(bool(evaluate(condition, context)), runs)
-            with self.subTest(workflow=workflow, owner="empty"):
-                context = {"env.HAS_BOARD_APP": "true", "steps.project-config.outputs.owner": ""}
-                self.assertFalse(evaluate(condition, context))
+            with self.subTest(client_id=client_id, key=key):
+                context = {
+                    "inputs.client-id": client_id,
+                    "inputs.private-key": key,
+                    "steps.project-config.outputs.owner": "example-org",
+                }
+                self.assertEqual(bool(evaluate(condition, context)), runs)
+        with self.subTest(owner="empty"):
+            context = {
+                "inputs.client-id": "id",
+                "inputs.private-key": "key",
+                "steps.project-config.outputs.owner": "",
+            }
+            self.assertFalse(evaluate(condition, context))
+
+    def test_the_action_derives_the_credential_flags_from_its_inputs(self):
+        # project_context.py reads HAS_BOARD_APP / HAS_BOARD_PAT from the environment; the action
+        # sets them on the owner step from the inputs, so the callers carry no job env for them.
+        step = action_step_block(OWNER_STEP)
+        self.assertIn("HAS_BOARD_APP: ${{ inputs.client-id != '' && inputs.private-key != '' }}", step)
+        self.assertIn("HAS_BOARD_PAT: ${{ inputs.has-board-pat }}", step)
+        expression = "inputs.client-id != '' && inputs.private-key != ''"
+        for client_id, key, expected in (("", "", False), ("id", "", False),
+                                         ("", "key", False), ("id", "key", True)):
+            with self.subTest(client_id=client_id, key=key):
+                context = {"inputs.client-id": client_id, "inputs.private-key": key}
+                self.assertIs(expected, bool(evaluate(expression, context)))
+        for workflow in BOARD_WORKFLOWS:
+            with self.subTest(workflow=workflow):
+                text = workflow_text(workflow)
+                self.assertNotIn("HAS_BOARD_", text)
+                self.assertIn("client-id: ${{ secrets.PROJECT_STATUS_APP_ID }}", text)
+                self.assertIn("private-key: ${{ secrets.PROJECT_BOARD_APP_PRIVATE_KEY }}", text)
+                self.assertIn("has-board-pat: ${{ secrets.PROJECT_BOARD_TOKEN != '' }}", text)
 
     def test_the_issue_syncs_keep_issue_writes_on_the_workflow_token(self):
         for workflow in ISSUE_SYNCS:

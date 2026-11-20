@@ -442,6 +442,7 @@ def current_parent_number(api, issue):
 def current_blocker_numbers(api, issue):
     result = gh(
         "api",
+        "--paginate",
         f"{api}/issues/{issue['number']}/dependencies/blocked_by",
         "--jq",
         ".[].number",

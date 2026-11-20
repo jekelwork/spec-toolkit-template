@@ -8,9 +8,11 @@ through the injected `run`, so tests never reach GitHub.
 import copy
 import json
 import os
+import shlex
 import tempfile
 from typing import NamedTuple
 
+import display_text
 import project_context
 
 
@@ -162,7 +164,7 @@ def gh_json(run, argv, body=None, cwd=None):
         return json.loads(output) if output.strip() else {}
     except ValueError as error:
         raise ValueError(
-            f"unexpected output from {' '.join(argv[:3])}: {output.strip()[:80]!r}"
+            f"unexpected output from {' '.join(argv[:3])}: {display_text.quoted_line(output.strip()[:80])}"
         ) from error
 
 
@@ -237,10 +239,16 @@ def load_board(owner, number, name, run):
         data = {}
     project = ((data.get("data") or {}).get("repositoryOwner") or {}).get("projectV2")
     if not project:
+        # The message is escaped where it is printed, and a printed command is never escaped (an
+        # escaped one would not run as shown): a name with an unsafe character or a backslash
+        # (which the escaping doubles) gets no command.
+        command = (f"`gh project create --owner {shlex.quote(owner)} --title {shlex.quote(name)}`"
+                   if not (display_text.has_unsafe(name) or "\\" in name) else
+                   "a project titled like project.name (its characters cannot be shown safely, "
+                   "so run `gh project create` by hand)")
         raise ValueError(
-            f"no GitHub Project #{number} found for {owner}; create one with "
-            f'`gh project create --owner {owner} --title "{name}"` and set github_project.number '
-            "in project-context.toml to its number"
+            f"no GitHub Project #{number} found for {owner}; create one with {command} and "
+            "set github_project.number in project-context.toml to its number"
         )
     return project
 
@@ -297,7 +305,7 @@ def plan_status_options(status, plan, run):
     for option in unmanaged:
         if option["name"].casefold() in {name.casefold() for name, _ in STATUS_OPTIONS}:
             raise ValueError(
-                f"the board has two Status options named {option['name']!r} apart from case; "
+                f"the board has two Status options named {display_text.quoted_line(option['name'])} apart from case; "
                 "delete or rename the extra one on the board, then run this command again"
             )
         plan.notes.append(f"Status option {option['name']} is not managed and stays as it is")
@@ -551,7 +559,7 @@ def plan_fork_approval(repo, run):
         return plan
     if current not in FORK_APPROVAL_POLICIES:
         plan.notes.append(
-            f"fork PR approval policy {current!r} is not one this tool knows; left unchanged"
+            f"fork PR approval policy {display_text.quoted_line(current)} is not one this tool knows; left unchanged"
         )
         return plan
 
@@ -610,9 +618,8 @@ def report_credentials(repo, run):
         if app and len(app) < len(APP_SECRETS):
             lines.append(f"Warning: only {app[0]} is set; the GitHub App needs both "
                          f"{' and '.join(APP_SECRETS)} (see {CREDENTIALS_GUIDE})")
-    if variables is not None:
-        state = "set" if "PHASE_SYNC_AUTO_APPLY" in variables else "not set"
-        lines.append(f"PHASE_SYNC_AUTO_APPLY: {state} (information only)")
+    if variables is not None and "PHASE_SYNC_AUTO_APPLY" in variables:
+        lines.append("PHASE_SYNC_AUTO_APPLY: set (Phase issues sync without a dry-run review)")
     return lines
 
 
@@ -684,51 +691,64 @@ def plan_settings(repo, context, run, allow_weaken=False):
     return plan, board_url
 
 
-def run_github(args, root, run, remote_default, out=print, hint=True):
+def run_github(args, root, run, remote_default, out=print, hint=True, plan_out=None):
     """Return the exit code: 0 clean or applied, 1 drift under --check (errors raise ValueError).
 
     `hint=False` leaves out the "run with --apply" advice of a preview, for a caller that applies
-    the plan itself (`bootstrap.py start`)."""
+    the plan itself (`bootstrap.py start`). `plan_out(plan)` is called with the plan as soon as it
+    is read, so that caller can use the same read for what it shows and counts.
+
+    Every line goes through `out` escaped (`display_text.printable`): the lines hold board option
+    names, the board URL, ruleset values and `gh` error text, which GitHub controls. `out`
+    receives them escaped once, so a caller must not escape them again."""
+    write = out
+
+    def emit(text=""):
+        write(display_text.printable(str(text)))
+
     path = root / project_context.DEFAULT_CONFIG.name
     if not path.exists():
         raise ValueError(project_context.missing_context_message(path))
     context = project_context.load_context(path)
     repo = repository_name(run, root, remote_default)
     plan, board_url = plan_settings(repo, context, run, getattr(args, "allow_weaken", False))
+    if plan_out is not None:
+        plan_out(plan)
 
-    out(f"Repository: {repo} · Board: {board_url}")
+    emit(f"Repository: {repo} · Board: {board_url}")
     for area in AREAS:
         for line_area, text in plan.lines:
             if line_area == area:
-                out(f"{area}: {text}")
+                emit(f"{area}: {text}")
     for warning in plan.warnings:
-        out(warning)
+        emit(warning)
     if not plan.lines and not plan.warnings:
-        out("Nothing to change: labels, board, ruleset and fork PR approval match.")
+        emit("Nothing to change: labels, board, ruleset and fork PR approval match.")
     for note in plan.notes:
-        out(f"Note: {note}")
+        emit(f"Note: {note}")
     manual = (f"Manual step (the API cannot read or set it): in {board_url} open Workflows and "
               'check that "Pull request linked to issue" is enabled with Status = In review; '
               "set it if not.")
     # The step names a Status option that exists only after the apply, so a preview with changes
     # leaves it out and --apply prints it last (research D18).
-    nothing_pending = not plan.lines and not plan.warnings
-    out("")
-    if args.check or (nothing_pending and not args.apply):
-        out(manual)
+    # Ruleset warnings are not changes the apply makes, so they do not hide it.
+    emit("")
+    if args.check or (not plan.lines and not args.apply):
+        emit(manual)
     for line in report_credentials(repo, run):
-        out(line)
+        emit(line)
 
     if args.check:
         return 1 if plan.lines or plan.warnings else 0
     if not args.apply:
         if plan.lines and hint:
-            out("")
-            out("Preview only; run with --apply to make these changes.")
+            emit("")
+            emit("Preview only; run with --apply to make these changes.")
         return 0
     apply_plan(plan)
     if plan.lines:
-        out("")
-        out(f"Applied {len(plan.lines)} change(s).")
-    out(manual)
+        emit("")
+        emit(f"Applied {len(plan.lines)} change(s).")
+    emit("")
+    emit(manual)
     return 0

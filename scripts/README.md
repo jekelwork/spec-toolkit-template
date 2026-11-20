@@ -45,18 +45,28 @@ latter) and, in a terminal, asks `Proceed? [y/N]`. Without a terminal or with
 `--no-input` it never prompts: it exits 3 after the preview and prints `To do it, run:` with the
 full command (`--confirm <step-id>@<digest>`, plus `--issue N` when several bootstrap issues are
 listed, and the same `init` flags: `--name`, `--description`, `--owner`, `--project-number` or
-`--create-board`, `--required-approvals`). Progress goes to stderr, and a performed step prints
-`Done: <step>: <result>.`. Without a terminal, missing `init` flags at `project_context` exit 1 with
-`Next step project_context needs your decisions` (exit 2 with `--confirm`). `--guided`, which needs
-`--confirm`, does only the confirmed step and ends with `Done. Go back to your coding agent and reply
-"done".`; the coding agent adds it to the commands it shows you.
+`--create-board`, `--required-approvals`). Progress and every other non-error output go to stdout
+and only errors to stderr, and a performed step prints `Done: <step>: <result>.`. The
+`first_sync` preview is a count summary of the dry run; `--full-dry-run` adds the full dry run and
+is carried in the confirming command, and the digest covers the full dry run either way. Untracked
+files do not stop `bootstrap_issue`; a changed tracked file does (commit, stash or revert it).
+The optional board credential note is printed once, after `Done: github_settings: …`, and not when
+`github_settings` was done earlier (`check` still reports it); the `github_settings` preview leaves
+that line out, while `github` itself still prints it. Without a terminal, missing `init` flags at
+`project_context` exit 1 with `Next step project_context needs your decisions` (exit 2 with
+`--confirm`). `--guided`, which needs `--confirm`, does only the confirmed step and ends with
+`Done. Go back to your coding agent and reply "done".`; the coding agent adds it to the commands it
+shows you.
 
-`--agents <tool>,…` (`claude`, `copilot`, `codex`) gives your choice of coding agents without asking: `start` saves it as `agent-setup.tools`
-in the local Git config, generates those agents' files and prints
-`Coding agents: <tools> (saved in git config agent-setup.tools).` and a line to run
-`npm run setup-agents` again whenever you change coding agents, then continues with the steps as
-usual. Without it, an interactive run that is not `--guided` asks `Which coding agents do you use?`
-once, when no choice is saved (Enter saves all three); with `--no-input` nothing is asked. There is
+`--agents <tool>,…` (`claude`, `copilot`, `codex`) gives your choice of coding agents without
+asking: `start` saves it as `agent-setup.tools` in the local Git config, generates those agents'
+files and prints `Coding agents: <tools> (saved in git config agent-setup.tools).` and a line to run
+`npm run setup-agents` again whenever you change coding agents. Without `--confirm` (without a
+terminal or with `--no-input`) it then prints
+`Go back to your coding agent and tell it the choice is saved.` and exits 0 without previewing the
+next step; with `--confirm` it continues with the steps as usual. Without it, an interactive run
+that is not `--guided` asks `Which coding agents do you use?` once, when no choice is saved (Enter
+saves all three); with `--no-input` nothing is asked. There is
 no preview or confirmation: it writes only local Git config and git-ignored files, and the step
 previews and digests do not change. If generating the files fails (exit 2), the choice stays saved
 and a rerun syncs again.
@@ -69,7 +79,7 @@ repository than the one `gh` uses or is not a GitHub repository; `pull_request` 
 push URL (`git remote get-url --push --all origin`), and `check --json` reports both steps as not
 performable in those cases. `first_sync` additionally needs the `origin` URL forms the sync itself
 reads (`https://github.com/` or `git@github.com:`) and requires `ROADMAP.md`, `specs/`, `scripts/`,
-`.github/workflows/`, `project-context.toml` and `.specify/memory/constitution.md` to be committed;
+`.github/workflows/`, `.github/actions/`, `project-context.toml` and `.specify/memory/constitution.md` to be committed;
 `bootstrap_issue` and `pull_request` accept SSH aliases and `ssh://`. Every preview of
 `bootstrap_issue`, `pull_request`, `first_sync` and `github_settings` includes a
 `Repository: <owner>/<name>` line, so the digest binds the target repository. Branch names in
@@ -89,6 +99,21 @@ in a terminal, and with `--yes` or without a terminal it fails naming the missin
 number comes from `--project-number` or `--create-board` (`gh project create`). The result is
 validated by `project_context.py` before an atomic write; an existing file needs `--force`.
 
+`display_text.py` (standard library only) is the one definition of the characters that are unsafe
+on a single output line: control characters, invisible and bidirectional formatting characters,
+line and paragraph separators, lone surrogates. `bootstrap.py`, `start`, `github` and the
+`check --json` report escape them with `display_text.printable` (`\x1b`, `\u202e`; a backslash
+becomes `\\`, so an escape cannot be faked), once, where text GitHub or git controls is printed.
+A command is never escaped: one that would contain such a character is left out. `init` refuses
+control characters, line and paragraph separators and every other format character (Unicode
+category Cf: the bidi controls and marks, zero-width space, word joiner, byte order mark, tag
+characters) in `--name` and `--description`; only the zero-width joiner U+200D (emoji sequences),
+the zero-width non-joiner U+200C and the soft hyphen U+00AD stay valid. These are the user's own
+values and are repeated unchanged, shell-quoted, in the confirming command. Messages are built from
+raw values and escaped once, where they are printed. A line feed inside a quoted value from GitHub,
+`gh` or git is shown as U+23CE (⏎), so the value stays on its line. `toml_string` writes every unsafe character as
+a `\uXXXX` escape (`\UXXXXXXXX` above U+FFFF).
+
 `github` (code in `bootstrap_github.py`) previews by default, one line per change grouped as
 Labels, Board, Ruleset and Actions; `--apply` makes them and `--check` changes nothing and exits 1 on drift.
 `--allow-weaken` lets `--apply` lower the approval count or turn off last-push approval of an existing ruleset; without it those changes only print a `Warning:`. Stale-review dismissal is never turned off: it is turned on with 2 or more approvals and otherwise left as it is. A `Note:` is printed when the existing ruleset has `bypass_actors`, because anyone or any App listed there can merge around the review requirement.
@@ -106,8 +131,8 @@ use a fake and never reach GitHub. What it manages:
   `In progress`, and `Todo` becomes `Backlog` when there is no `Backlog` (otherwise `Todo` stays and
   is listed as unmanaged). Missing options are appended, the managed five come first and unmanaged
   ones follow; a board that already has all five is never reordered. A board that does not exist is
-  an error (create one with `gh project create --owner <owner> --title "<name>"` and set
-  `github_project.number`); so is a `Roadmap order` field of another type.
+  an error (create one with `gh project create --owner <owner> --title <name>`, both shell-quoted
+  as needed, and set `github_project.number`); so is a `Roadmap order` field of another type.
 - **Actions** fork pull request workflow approval (`GET`/`PUT repos/{owner}/{repo}/actions/permissions/fork-pr-contributor-approval`): raised to `all_external_contributors` (preview line `Actions: fork PR approval first_time_contributors → all_external_contributors`). It is never lowered: a policy that is already that, or one this tool does not know, is left alone (an unknown one prints a `Note:`). Private repositories have no such policy (GitHub answers 422); they are skipped with a `Note:`. Reading or writing it needs repository admin rights; a 403 or 404 on a public repository says so.
 - **Ruleset** `Default branch protection` on the default branch, created when no repository ruleset
   has that name: active, no branch deletion, no force pushes, a pull request with
@@ -146,9 +171,11 @@ secret store and does not override the constitution, workflow gates, GitHub
 CODEOWNERS, or Spec Kit configuration. `--config PATH` validates another file.
 Missing or invalid settings cause an error rather than selecting a default board.
 `project.name` and `project.description` must be a non-empty single line without
-control characters and bidi controls (an existing multi-line or tab-containing value is rejected).
+control characters, separators and format characters such as bidi controls, except the zero-width
+joiner and non-joiner and the soft hyphen (an existing multi-line or tab-containing value is
+rejected).
 The project-status workflow validates this file before creating its App token.
-`--board-owner-or-skip` (with `--repository-owner`, reading `HAS_BOARD_APP` and `HAS_BOARD_PAT`) is what the board workflows' shared "Read configured Project owner" step calls: it prints `github_project.owner` on stdout, or an empty owner and a skip notice on stderr when no board credential is configured or the repository is not initialized yet. Once initialized, a missing or invalid file, or an owner that differs from the repository owner, is an error.
+`--board-owner-or-skip` (with `--repository-owner`, reading `HAS_BOARD_APP` and `HAS_BOARD_PAT`) is what the board workflows' shared "Read configured Project owner" step (in the local composite action `.github/actions/board-token`) calls: it prints `github_project.owner` on stdout, or an empty owner and a skip notice on stderr when no board credential is configured or the repository is not initialized yet. Once initialized, a missing or invalid file, or an owner that differs from the repository owner, is an error.
 `sync-project-status.py` uses `github_project.owner` and `github_project.number`
 for any board options not explicitly supplied on the command line.
 
@@ -193,8 +220,8 @@ A new project is created from the
 [jekelwork/spec-toolkit-template](https://github.com/jekelwork/spec-toolkit-template) template (see
 [`docs/bootstrap.md`](../docs/bootstrap.md)). The template is kept in the not-yet-initialized
 state (see [`project_context.py`](#not-yet-initialized-state)): it has no `ROADMAP.md`, `specs/`,
-`project-context.toml` or constitution, so every new repository starts there too. Its `README.md`
-and `AGENTS.md` still link to those files, which the new project creates during bootstrap.
+`project-context.toml` or constitution, so every new repository starts there too. Its `AGENTS.md`
+and the docs under `docs/` still link to those files, which the new project creates during bootstrap.
 Until then `check_roadmap.py`, `roadmap_status.py` and `sync-roadmap-issues.py` print
 `Not initialized yet: no ROADMAP.md. See docs/bootstrap.md.` and exit 0, and the Toolkit workflow
 skips the roadmap check with a `::notice::`.
@@ -202,7 +229,7 @@ skips the roadmap check with a `::notice::`.
 The board workflows skip with a `::notice::` instead of failing while
 the repository is not initialized (no `project-context.toml` yet) or no board
 credential (App secrets or `PROJECT_BOARD_TOKEN`) is configured (`sync-project-status.yml`, and the board part of `sync-roadmap-issues.yml` and
-`sync-spec-tasks.yml`); once the repository is initialized, a missing
+`sync-phase-issues.yml`); once the repository is initialized, a missing
 `project-context.toml` fails them with "Missing project context". The first bootstrap pull request needs an issue-backed
 branch such as `<issue>-chore-bootstrap` with a `CHORE:` issue title; the
 roadmap gate only checks Phase branches, so it passes there.
@@ -237,7 +264,7 @@ appears, which shows the guard can fail. Run the tests with
 `python3 -m unittest scripts.test_setup_plan scripts.test_speckit_workflow_scripts`.
 
 Never edit these generated scripts by hand; change them only through
-`scripts/specify.sh` (see the Spec Kit upgrade notes in the root `README.md`).
+`scripts/specify.sh` (see [Spec Kit CLI and version](../docs/coding-agents.md#spec-kit-cli-and-version)).
 
 ## check_roadmap.py
 
@@ -438,8 +465,8 @@ python3 scripts/sync-roadmap-issues.py --apply --skip-project
 
 - `--id NNN` limits issue changes to one canonical roadmap ID; otherwise entries are processed in file order. Roadmap and planning issues are found by their markers, not their titles.
 - The Epic body lists the entry's Description, Outcome, Scope (in), Scope (out), Depends on, Governed by and Notes, in that order, when present. Following lines (indented or not) continue the field and are joined with single spaces, as in the roadmap validator; blank lines are skipped and only a new field or a heading ends the field. Fenced code blocks, including their content, are dropped from the Epic body, and nested bullets and line breaks inside a field are flattened into one line, so keep roadmap fields to plain prose.
-- `planned` creates or updates an Epic, the `SPEC: <ID> Create and approve spec and plan` planning issue and one provisional `Phase 1: Kickoff — <Epic name>` Story (stable `phase-1` marker). Both are sub-issues of the Epic, and Phase 1 is blocked by the spec-and-plan issue. When the spec-and-plan issue closes as completed, only that blocker is cleared (never re-added; other blockers are preserved). There is no tasks planning issue. Once `specs/<feature>/tasks.md` exists, roadmap sync stops updating Phase 1 and leaves it to the task sync.
-- `needs-info` keeps the Epic and labels it `needs-info`; any existing planning and Phase issues are closed as not planned. Returning to `planned` creates missing planning issues and reopens the same paused Phase issues. `deferred` closes open Epic, planning and Phase issues as not planned; returning to `planned` reopens those same Phase issues. `abandoned` and removed entries are closed as not planned and labeled `abandoned`; their Phase issues are retired and never reopened automatically. Closing an entry is blocked while any Phase is In progress, In review or Done, so resolve that work explicitly first. `undecided` creates no issues. The roadmap sync does not reopen a completed Epic; the task sync reopens it if checkbox changes make Phase work incomplete again.
+- `planned` creates or updates an Epic, the `SPEC: <ID> Create and approve spec and plan` planning issue and one provisional `Phase 1: Kickoff — <Epic name>` Story (stable `phase-1` marker). Both are sub-issues of the Epic, and Phase 1 is blocked by the spec-and-plan issue. When the spec-and-plan issue closes as completed, only that blocker is cleared (never re-added; other blockers are preserved). There is no tasks planning issue. Once `specs/<feature>/tasks.md` exists, roadmap sync stops updating Phase 1 and leaves it to the Phase sync.
+- `needs-info` keeps the Epic and labels it `needs-info`; any existing planning and Phase issues are closed as not planned. Returning to `planned` creates missing planning issues and reopens the same paused Phase issues. `deferred` closes open Epic, planning and Phase issues as not planned; returning to `planned` reopens those same Phase issues. `abandoned` and removed entries are closed as not planned and labeled `abandoned`; their Phase issues are retired and never reopened automatically. Closing an entry is blocked while any Phase is In progress, In review or Done, so resolve that work explicitly first. `undecided` creates no issues. The roadmap sync does not reopen a completed Epic; the Phase sync reopens it if checkbox changes make Phase work incomplete again.
 - Dependencies are synchronized as GitHub "blocked by" links between marked roadmap Epics. Only stale links between those epics are removed; unrelated links are preserved.
 - Only trusted issues are matched by marker, for lookups, removals and dependencies alike: the author is a bot (any login ending in `[bot]`, so every App installed on the repository), or the `author_association` is `OWNER`, `MEMBER` or `COLLABORATOR`, or the issue carries an `Epic`, `Story` or `Planning` label (setting a label needs triage rights, so legitimate issues of a departed author or a private member reported as `CONTRIBUTOR` still match and no duplicate Epic is created). Other marker copies are ignored with a warning and are never closed, labelled or commented on.
 - `--skip-project` skips Project updates. Otherwise the script uses `github_project.owner` and `github_project.number` from [`project-context.toml`](../project-context.toml), adds roadmapped Epics, planning issues and the provisional Phase 1, sets the Epic's one-based `Roadmap order` field, and sets Phase 1 to `Planned` when its status is unset or `Backlog`. `--project-owner` and `--project-number` override the corresponding settings. A missing field is reported without failing the sync. Adding an issue to the board is idempotent: when GitHub answers that the content already exists in the project (its built-in "Auto-add sub-issues to project" workflow adds sub-issues once their Epic is on the board), the existing item is used. The sync looks it up again a few times; if it is still not visible it stops with `... is already in project ..., but it is not visible yet; rerun the sync`, so rerun it. Any other refusal fails with GitHub's message.
@@ -471,7 +498,7 @@ python3 scripts/sync-task-issues.py --roadmap-only --apply --skip-project
 - Only creates issues in the repository named by `git remote origin`. Create the labels first with `python3 scripts/bootstrap.py github --apply`.
 - If an issue-sync run is cancelled while waiting for the shared `issue-sync` concurrency group, the
   daily preview identifies missed Phase updates. To apply a recovery immediately, run
-  **Sync Spec Tasks to GitHub Issues** on `main` with **Apply changes** selected and no feature
+  **Sync Phase Issues** on `main` with **Apply changes** selected and no feature
   input; review the preview first if applying changes has not been approved.
 - Maintaining `tasks.md` directly in reviewed implementation PRs is allowed. Rerun `speckit-analyze` after structural edits (Phases, tasks, dependencies), not after checkbox-only or wording changes.
 
@@ -545,10 +572,10 @@ python3 scripts/sync-project-status.py --all --project-owner example-org --proje
 
 From roadmap entry to synchronized Phase issues, with 008 as the example:
 
-1. **Sync roadmap issues.** The **Sync Roadmap to GitHub Issues** workflow creates the Epic, the spec-plan planning issue and the provisional Phase 1 story after a planned entry merges to `main`. Review the dry-run output during rollout; approve the manual apply run before enabling automatic apply on pushes. Until apply is enabled, the Phase 1 blocker will not be cleared automatically after the spec-and-plan PR merges.
+1. **Sync roadmap issues.** The **Sync Roadmap to GitHub Issues** workflow creates the Epic, the spec-plan planning issue and the provisional Phase 1 story after a planned entry merges to `main`. Push and daily runs only preview; review the dry-run output, then approve a manual run with **Apply changes** selected. The Phase 1 blocker is not cleared after the spec-and-plan PR merges until such a manual apply has run.
 2. **Spec and plan.** Create the branch from the `SPEC: 008 Create and approve spec and plan` issue (`gh issue develop <issue-number> --base main --name <issue-number>-spec-008-create-and-approve-spec-and-plan --checkout`) and follow its checklist: every `before_`/`after_` hook from `.specify/extensions.yml` (before specifying, `roadmap-entry.check` validates `SPECIFY_FEATURE_DIRECTORY=specs/008-<slug>` and warns if prerequisites remain), `speckit-specify`, `speckit-clarify`, user approval of the spec, `speckit-plan`, review and a non-author approval. Keep the roadmap plan-only. Merging the pull request closes the issue and the workflow refreshes artifact links; when apply is enabled, it also clears the Phase 1 blocker.
 3. **Tasks.** Pull `main`, create the Phase 1 implementation branch from the provisional Phase 1 issue, and run `plan-merged.check`, `speckit-tasks` with its hooks and `speckit-analyze` with CRITICAL findings resolved, then commit `tasks.md` and push the branch with the user's approval. There is no separate tasks PR; `tasks.md` is reviewed with the implementation PR and can be maintained directly in later reviewed implementation PRs.
-4. **Automatic sync.** The merge of a PR that adds `tasks.md` runs the Sync Spec Tasks to GitHub Issues workflow, which updates Phase 1 from `tasks.md` and creates the other Phase issues under the existing Epic.
+4. **Automatic sync.** The merge of a PR that adds `tasks.md` runs the Sync Phase Issues workflow, which updates Phase 1 from `tasks.md` and creates the other Phase issues under the existing Epic.
 5. **Confirm the post-merge sync.** Check that the workflow run succeeded and that `python3 scripts/sync-task-issues.py --feature specs/008-<slug> --check` exits 0. This verifies Phase issues after the implementation PR merges; it is not a gate before implementation.
 6. **Recover a failed sync.** Re-run the workflow from the Actions tab (**Run workflow** on `main`, `feature` = `specs/008-<slug>`), or run `python3 scripts/sync-task-issues.py --feature specs/008-<slug> --apply` locally; then repeat the `--check`.
 
@@ -576,8 +603,8 @@ numbered spec directory when a feature branch resembles an issue branch, and
 `check-push`, by the `branch-name` pre-push hook in
 [lefthook.yml](../lefthook.yml). `check-push` reads Git's pre-push lines from
 stdin and checks the format of each pushed remote branch name, skipping tags,
-deletions and `main`. See the root
-[branch and pull request conventions](../README.md#branch-and-pull-request-conventions)
+deletions and `main`. See the
+[branch and pull request conventions](../docs/ci-and-conventions.md#branch-and-pull-request-conventions)
 for the issue/roadmap ID collision caveat.
 
 ```bash
@@ -594,7 +621,7 @@ python3 -m unittest scripts/test_pr_conventions.py
 
 ## agent_setup.py
 
-Keeps one copy of each agent skill and sub-agent and one Spec Kit version (see [Coding agents](../README.md#coding-agents)).
+Keeps one copy of each agent skill and sub-agent and one Spec Kit version (see [Coding agents](../docs/coding-agents.md#coding-agents)).
 
 `check` is run by the Repository tools CI job and the `agent-setup` pre-commit hook. It does not depend on which tools a developer generates, and fails when:
 
