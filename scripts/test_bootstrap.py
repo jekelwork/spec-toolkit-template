@@ -477,6 +477,16 @@ class ValidateInMemoryTest(unittest.TestCase):
                 self.assertEqual(flag, raised.exception.flag)
                 self.assertEqual(requirement, raised.exception.requirement)
 
+    def test_a_too_long_description_is_reported_with_the_length_message(self):
+        context = {**self.CONTEXT, "project": {"name": "N", "description": "D" * 351}}
+
+        with self.assertRaises(bootstrap.project_context.InvalidValue) as raised:
+            bootstrap.validate(context)
+
+        self.assertEqual("--description", raised.exception.flag)
+        self.assertEqual(bootstrap.project_context.DESCRIPTION_TOO_LONG_MESSAGE,
+                         raised.exception.requirement)
+
     def test_init_and_github_reject_abbreviated_options(self):
         parser = bootstrap.build_parser()
         for argv in (["init", "--desc", "D"], ["init", "--proj", "3"], ["github", "--appl"],

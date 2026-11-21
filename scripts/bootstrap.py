@@ -177,6 +177,8 @@ def validate(context):
     except ValueError as error:
         for section, key, flag, requirement in FLAG_MESSAGES:
             if str(error).startswith(f"{section}.{key}"):
+                if str(error).endswith(project_context.DESCRIPTION_TOO_LONG_MESSAGE):
+                    requirement = project_context.DESCRIPTION_TOO_LONG_MESSAGE
                 raise project_context.InvalidValue(
                     flag, shown(section, key), requirement) from error
         raise

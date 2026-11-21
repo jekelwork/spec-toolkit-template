@@ -673,7 +673,8 @@ def detect_board_credential(repo, run):
             f"({bootstrap_check.first_line(found.error)})",
             action=action("Fix the cause, then run the check again.",
                           "python3 scripts/bootstrap.py check", CREDENTIALS_DOC))
-    note = "" if found.organization_checked else " (organization secrets not checked)"
+    unchecked = "" if found.organization_checked else "organization secrets not checked"
+    note = f" ({unchecked})" if unchecked else ""
     kind, apps = bootstrap_github.classify_credential(found.names)
     if kind == "app":
         return make_step("board_credential", "done", "Board credential: GitHub App configured",
@@ -692,8 +693,9 @@ def detect_board_credential(repo, run):
             action=action(f"Add {missing}, or remove {present}; board sync is skipped until the "
                           "credential is complete.", None, CREDENTIALS_DOC),
             details={"secrets": [present]})
+    qualifier = f"optional; {unchecked}" if unchecked else "optional"
     return make_step(
-        "board_credential", "optional", f"Board credential not configured (optional){note}",
+        "board_credential", "optional", f"Board credential not configured ({qualifier})",
         action=action("Add a board credential to sync the board; it is skipped until then.",
                       None, CREDENTIALS_DOC),
         details={"secrets": []})

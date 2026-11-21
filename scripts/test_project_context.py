@@ -59,6 +59,17 @@ class ProjectContextTest(unittest.TestCase):
                              f"{key} = {json.dumps(value)}")
         return project_context.parse_context(text)
 
+    def test_description_accepts_350_characters_and_rejects_351(self):
+        self.assertEqual("a" * 350, self.parse_with("description", "a" * 350)["project"]["description"])
+        with self.assertRaises(ValueError) as raised:
+            self.parse_with("description", "a" * 351)
+        self.assertEqual(
+            "project.description must be at most 350 characters (GitHub's repository "
+            "description limit)", str(raised.exception))
+
+    def test_description_limit_counts_characters_not_bytes(self):
+        self.assertEqual(350, len(self.parse_with("description", "\u00e4" * 350)["project"]["description"]))
+
     def test_name_and_description_reject_control_and_line_separator_characters(self):
         for key in ("name", "description"):
             for label, char in (("newline", "\n"), ("tab", "\t"), ("escape", "\x1b"),
