@@ -50,6 +50,10 @@ TABLE = {
 STATES = ("done", "todo", "manual", "optional", "waiting", "not_checked")
 
 
+UNREAD_TITLE = (
+    "Board credential not configured (optional; organization secrets not checked)")
+
+
 class CatalogueTest(unittest.TestCase):
     def test_eleven_steps_in_the_fixed_order(self):
         self.assertEqual(IDS, tuple(entry.id for entry in bootstrap_steps.CATALOGUE))
@@ -1365,9 +1369,10 @@ class BoardCredentialTest(unittest.TestCase):
         step = self.detect(run)
 
         self.assertEqual("optional", step.state)
-        self.assertIn("(organization secrets not checked)", step.title)
+        self.assertEqual(UNREAD_TITLE, step.title)
+        self.assertEqual(1, step.title.count("("))
         step = self.detect(secret_world(["UNRELATED"]))
-        self.assertNotIn("organization secrets not checked", step.title)
+        self.assertEqual("Board credential not configured (optional)", step.title)
 
     def test_unread_organization_secrets_are_said_for_half_an_app_too(self):
         run = secret_world([bootstrap_github.APP_SECRETS[0]])

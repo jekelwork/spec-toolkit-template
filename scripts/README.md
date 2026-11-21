@@ -161,6 +161,9 @@ python3 scripts/project_context.py
 python3 -m unittest scripts.test_project_context
 ```
 
+The description is one line of at most 350 characters (GitHub's repository description
+limit), because the bootstrap guide passes it unchanged to skills.
+
 Update the project name and description when reusing the agent instructions, and
 set the GitHub Projects owner and number to the intended board. The
 [`project-context.example.toml`](../project-context.example.toml) file provides

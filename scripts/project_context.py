@@ -54,6 +54,10 @@ OWNER_PATTERN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 # separators and format characters except ZWJ, ZWNJ and soft hyphen) are defined once, in
 # display_text.
 SINGLE_LINE_MESSAGE = "must be a non-empty single-line string without control characters"
+DESCRIPTION_MAX_LENGTH = 350
+DESCRIPTION_TOO_LONG_MESSAGE = (
+    f"must be at most {DESCRIPTION_MAX_LENGTH} characters (GitHub's repository description limit)"
+)
 
 
 class InvalidValue(ValueError):
@@ -171,6 +175,8 @@ def parse_context(text):
         if (not isinstance(value, str) or not value.strip()
                 or any(display_text.is_input_forbidden(char) for char in value)):
             raise ValueError(f"project.{key} {SINGLE_LINE_MESSAGE}")
+    if len(context["project"]["description"]) > DESCRIPTION_MAX_LENGTH:
+        raise ValueError(f"project.description {DESCRIPTION_TOO_LONG_MESSAGE}")
     owner = context["github_project"]["owner"]
     if not isinstance(owner, str) or len(owner) > 39 or not OWNER_PATTERN.fullmatch(owner):
         raise ValueError("github_project.owner must be a GitHub owner login")
