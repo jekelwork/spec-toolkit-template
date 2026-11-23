@@ -29,20 +29,12 @@ NOT_PLANNED_COMMENTS = {
     "needs-info": "This roadmap entry needs more information. Its managed issues are closed as not planned.",
 }
 CREATE_PAUSE_SECONDS = 0.25
-def entry_spec_paths(root, entry):
-    paths = set()
-    if entry.get("spec_dir"):
-        paths.add(entry["spec_dir"].strip("/"))
-    for path in (root / "specs").glob(f"{entry['id']}-*"):
-        if path.is_dir():
-            paths.add(path.relative_to(root).as_posix())
-    return sorted(paths)
+# Issues created in this run, fetched by number: the issue listing can lag behind creation.
+CREATED = []
 
 
 def feature_path_for(root, entry):
-    paths = entry_spec_paths(root, entry)
-    preferred_path = paths[0] if len(paths) == 1 else None
-    return roadmap_issues.feature_path(entry, preferred_path)
+    return roadmap_issues.feature_path_for(root, entry)
 
 
 def find_phase1(issues, feature_path):
@@ -279,7 +271,9 @@ def create_if_missing(repository, title, body, labels, apply):
     if not apply:
         dry_run(f"create {title}")
         return True
-    print(f"created {sync.create_issue(repository, title, body, labels)}")
+    url = sync.create_issue(repository, title, body, labels)
+    print(f"created {url}")
+    CREATED.append(sync.fetch_issue(f"repos/{repository}", sync.issue_number(url)))
     time.sleep(CREATE_PAUSE_SECONDS)
     return True
 
@@ -413,10 +407,17 @@ def sync_roadmap_entry(root, api, repository, entry, issues, apply):
         )
 
 
-def reload_issues(root, api, entries, attempts=6, delay=2):
+def load_issues_with_created(api):
+    """The issue listing plus the issues this run created that the listing does not show yet."""
+    return sync.merge_created(sync.load_issues(api), CREATED)
+
+
+def reload_issues(
+    root, api, entries, attempts=sync.VISIBILITY_ATTEMPTS, delay=sync.VISIBILITY_DELAY
+):
     missing = []
     for attempt in range(attempts):
-        issues = sync.load_issues(api)
+        issues = load_issues_with_created(api)
         indexed = {
             entry["id"]: roadmap_issues.index_roadmap_issues(issues, entry["id"])
             for entry in entries
@@ -439,9 +440,11 @@ def reload_issues(root, api, entries, attempts=6, delay=2):
         if not missing:
             return issues
         if attempt + 1 < attempts:
-            time.sleep(delay)
+            time.sleep(sync.visibility_delay(attempt, delay))
     sys.exit(
-        "Created roadmap issues did not become visible in time: " + ", ".join(missing)
+        "Created roadmap issues did not become visible in time: "
+        + ", ".join(missing)
+        + ". They exist; rerun the sync to finish linking them."
     )
 
 
@@ -799,7 +802,18 @@ def apply_sync(args, root):
     owner, repo = sync.origin_repo()
     repository = f"{owner}/{repo}"
     api = f"repos/{owner}/{repo}"
+    del CREATED[:]
     issues = sync.load_issues(api)
+    if args.report_sync_state:
+        print(f"Roadmap Epic exists: {'yes' if marker_roadmap_ids(issues) else 'no'}")
+    if args.apply_if_synced and not args.apply:
+        if marker_roadmap_ids(issues):
+            args.apply = True
+        else:
+            print(
+                "No roadmap Epic exists yet, so this run stays a preview: the first roadmap sync "
+                "is a manual, reviewed step (run this workflow with Apply changes selected)."
+            )
     mode = "apply" if args.apply else "dry run"
     print(f"Roadmap issue sync ({mode}; {len(entries)} entr{'y' if len(entries) == 1 else 'ies'})")
 
@@ -835,7 +849,7 @@ def apply_sync(args, root):
             blocked = sync_roadmap_entry(root, api, repository, entry, issues, True)
             if blocked:
                 blocked_entries.add(entry["id"])
-        issues = sync.load_issues(api)
+        issues = load_issues_with_created(api)
         issue_map.update(
             {
                 entry["id"]: roadmap_issues.index_roadmap_issues(issues, entry["id"])
@@ -900,6 +914,16 @@ def apply_sync(args, root):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Synchronize roadmap entries to GitHub issues.")
     parser.add_argument("--apply", action="store_true", help="Make changes (default: dry run)")
+    parser.add_argument(
+        "--apply-if-synced",
+        action="store_true",
+        help="Make changes only once a roadmap Epic exists (the first sync stays a manual preview)",
+    )
+    parser.add_argument(
+        "--report-sync-state",
+        action="store_true",
+        help="Print whether a roadmap Epic exists (the pull request preview uses it)",
+    )
     parser.add_argument("--id", dest="roadmap_id", help="Synchronize one roadmap entry")
     parser.add_argument("--skip-project", action="store_true", help="Skip GitHub Project changes")
     parser.add_argument("--project-owner", help="default: github_project.owner in project-context.toml")
@@ -913,6 +937,8 @@ def main(argv=None):
         sys.exit(f"Cannot determine the bootstrap state: {error}")
     if state == "uninitialized":
         print(project_context.NOT_INITIALIZED_MESSAGE)
+        if args.report_sync_state:
+            print("Roadmap Epic exists: no")  # nothing is synced before the repository is initialized
         return 0
     sync.project_arguments(args)
     return apply_sync(args, sync.ROOT)

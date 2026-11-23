@@ -697,7 +697,8 @@ def detect_board_credential(repo, run):
     return make_step(
         "board_credential", "optional", f"Board credential not configured ({qualifier})",
         action=action("Add a board credential to sync the board; it is skipped until then.",
-                      None, CREDENTIALS_DOC),
+                      f"gh secret set {bootstrap_github.TOKEN_SECRET} -R {shlex.quote(repo)}",
+                      CREDENTIALS_DOC),
         details={"secrets": []})
 
 
@@ -988,6 +989,12 @@ def _without_open_pull_request(root, run, repo, ctx, prs, current, own, note, or
                   ctx, root, run, details, repo, origin)
 
 
+def _update_default_branch(default):
+    """The command that checks out the default branch and fast-forwards it to GitHub's."""
+    quoted = shlex.quote(default)
+    return f"git switch {quoted} && git pull --ff-only origin {quoted}"
+
+
 def detect_merge(ctx, prs):
     """Waiting while the bootstrap PR is open; todo when there is none to merge (D2)."""
     if ctx.bootstrap_merged:
@@ -1000,9 +1007,15 @@ def detect_merge(ctx, prs):
         title = f"PR #{number} is open and waiting to be merged"
         if failing:
             title = f"{title}; failing checks: {', '.join(failing)}"
+        if ctx.default_branch is None:  # gh could not tell the default branch
+            merge_action = action(f"Review and merge PR #{number} on GitHub.", None, PR_DOC)
+        else:
+            merge_action = action(
+                f"Review and merge PR #{number} on GitHub, then run the command below.",
+                _update_default_branch(ctx.default_branch), PR_DOC)
         return make_step(
             "merge", "waiting", title,
-            action=action(f"Review and merge PR #{number} on GitHub.", None, PR_DOC),
+            action=merge_action,
             details={"pull_request": {"number": number, "branch": branch},
                      "failing_checks": failing})
     if prs.merged and ctx.bootstrap_merged is False:
@@ -1165,8 +1178,7 @@ def _first_sync_step(root, run, repo, ctx, skip_project, check_origin=False):
     elif not on_tip:
         step_action = action(
             f"Check out the tip of {default}: the sync reads exactly what is on GitHub.",
-            f"git switch {shlex.quote(default)} && git pull --ff-only origin {shlex.quote(default)}",
-            SYNC_DOC)
+            _update_default_branch(default), SYNC_DOC)
     elif dirty:
         step_action = action(f"Commit or stash these paths first: {', '.join(dirty)}.", None,
                              SYNC_DOC)

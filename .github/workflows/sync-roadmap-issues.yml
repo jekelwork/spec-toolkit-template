@@ -31,7 +31,14 @@ jobs:
     # On the job, not the workflow: a skipped feature-branch run must not cancel a pending run on the
     # default branch. Read-only previews must not replace a pending issue-mutating sync.
     concurrency:
-      group: ${{ github.event_name == 'workflow_dispatch' && inputs.apply == true && 'issue-sync' || 'issue-sync-preview' }}
+      # Applying runs have their own group, apart from the Phase sync's `issue-sync`: one merge of a
+      # tasks.md change starts both syncs, and a group holds one running and one pending job, so a
+      # shared group could drop one of them. Running side by side is safe: both syncs are
+      # idempotent and find their issues by marker, and the roadmap sync leaves Phase issues to the
+      # Phase sync once tasks.md exists. A push may apply (see the sync step) unless the switch is
+      # off. Expressions ignore case but cannot trim, so the step below ignores case too and rejects
+      # a padded value: ` false ` takes the apply group here and then fails there, consistently.
+      group: ${{ ((github.event_name == 'workflow_dispatch' && inputs.apply == true) || (github.event_name == 'push' && vars.ROADMAP_SYNC_AUTO_APPLY != 'false')) && 'issue-sync-roadmap' || 'issue-sync-preview' }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
@@ -57,10 +64,28 @@ jobs:
           # App token first; PROJECT_BOARD_TOKEN only once the project context is read.
           BOARD_GH_TOKEN: ${{ steps.board.outputs.token || (steps.board.outputs.owner != '' && secrets.PROJECT_BOARD_TOKEN) || '' }}
           APPLY_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.apply }}
+          # `false` (any case) turns automatic apply on push off; unset or `true` leaves it on; any
+          # other value, including one with surrounding spaces, fails the push run.
+          AUTO_APPLY: ${{ vars.ROADMAP_SYNC_AUTO_APPLY }}
         run: |
           args=()
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$APPLY_REQUESTED" == "true" ]]; then
             args+=(--apply)
+          elif [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            switch=$(printf '%s' "$AUTO_APPLY" | tr '[:upper:]' '[:lower:]')
+            case "$switch" in
+              false)
+                echo "Automatic apply is off (ROADMAP_SYNC_AUTO_APPLY=false); preview only."
+                ;;
+              "" | true)
+                # The script applies only once a roadmap Epic exists; the first sync stays manual.
+                args+=(--apply-if-synced)
+                ;;
+              *)
+                echo "::error::ROADMAP_SYNC_AUTO_APPLY must be true or false (any case), not '$AUTO_APPLY'." >&2
+                exit 1
+                ;;
+            esac
           fi
           if [[ -z "$BOARD_GH_TOKEN" ]]; then
             args+=(--skip-project)

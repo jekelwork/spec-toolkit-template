@@ -2,6 +2,7 @@
 # Model ids are tool-specific (Claude aliases do not work in Copilot). A missing key inherits the tool's session setting.
 
 [agents]
+Explore = "search"
 code-reviewer = "critical-review"
 security-auditor = "critical-review"
 tdd-implementer = "implementation"
@@ -37,6 +38,16 @@ effort = "medium"
 [profiles.verification.codex]
 model = "gpt-5.6-terra"
 effort = "medium"
+
+[profiles.search.claude]
+model = "haiku"
+effort = "low"
+[profiles.search.copilot]
+model = "claude-haiku-5.5"
+effort = "low"
+[profiles.search.codex]
+model = "gpt-5.6-luna"
+effort = "low"
 
 [profiles.default.claude]
 model = "sonnet"

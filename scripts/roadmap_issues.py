@@ -57,6 +57,29 @@ def feature_path(entry, preferred_path=None):
     )
 
 
+def entry_spec_paths(root, entry):
+    """The spec directories of a roadmap entry: its `Spec dir`, and every `specs/<id>-*` directory."""
+    root = Path(root)
+    paths = set()
+    if entry.get("spec_dir"):
+        paths.add(entry["spec_dir"].strip("/"))
+    for path in (root / "specs").glob(f"{entry['id']}-*"):
+        if path.is_dir():
+            paths.add(path.relative_to(root).as_posix())
+    return sorted(paths)
+
+
+def feature_path_for(root, entry):
+    """The one feature path the Epic body is rendered for, the same in every sync.
+
+    The roadmap sync and the task sync both use this, so one merge that starts both does not make
+    them rewrite the Epic body in turn. With several `specs/<id>-*` directories and no `Spec dir`,
+    the entry's default `specs/<id>-<slug>` path is used, whichever directory is being synced.
+    """
+    paths = entry_spec_paths(root, entry)
+    return feature_path(entry, paths[0] if len(paths) == 1 else None)
+
+
 def develop_command(roadmap_id, key):
     branch = f"<issue-number>-spec-{roadmap_id}-{slugify(dict(PLANNING)[key])}"
     return f"`gh issue develop <issue-number> --base main --name {branch} --checkout`"
@@ -82,8 +105,9 @@ def spec_plan_body(entry, feature_path):
         "- [ ] Get the independent approvals the constitution requires, mirrored in "
         "`[review] required_approvals` in `project-context.toml` (required, no implicit "
         "default; the constitution wins; 0 is valid only where the constitution allows a solo "
-        "project), then merge. Merging closes this issue; Phase 1 is "
-        "unblocked by the next manual roadmap sync run with **Apply changes** selected.\n\n"
+        "project), then merge. Merging closes this issue; the roadmap sync that runs on the merge "
+        "then unblocks Phase 1 (if the repository turned that off with "
+        "`ROADMAP_SYNC_AUTO_APPLY=false`, run the sync manually with **Apply changes** selected).\n\n"
         "**Rules that apply along the way:**\n\n"
         "- Around each Spec Kit command, run every `before_` and `after_` hook that "
         "`.specify/extensions.yml` defines for it (for example `before_specify`; `speckit-clarify` "
@@ -114,8 +138,9 @@ def provisional_phase_body(entry, feature_path):
         f"{roadmap_phase_marker(roadmap_id, 'phase-1')}\n\n"
         f"Provisional Phase 1 for roadmap entry **{roadmap_id} — {entry['title']}**. It is blocked "
         "by the spec-and-plan planning issue until that pull request is merged. "
-        "The sync removes the blocker only in a manual run of the roadmap sync workflow with "
-        "**Apply changes** selected; push and daily runs only preview.\n\n"
+        "The roadmap sync removes the blocker after that merge, in the run on the push to the "
+        "default branch, or in a manual run with **Apply changes** selected when the repository "
+        "variable `ROADMAP_SYNC_AUTO_APPLY` is `false`; daily runs only preview.\n\n"
         "Start the Phase 1 implementation branch from this issue. Generate the initial "
         f"`{feature_path}/tasks.md` there with `speckit-tasks`, then run `speckit-analyze` before "
         "coding, and include `tasks.md` in the implementation pull request. When that pull request "
@@ -226,6 +251,11 @@ def is_trusted_author(issue):
 
     That is a bot or app (every installed App, any `[bot]` author), a repository insider, or an issue
     carrying a maintainer-only label.
+
+    Trust assumption: every `[bot]` author is trusted, not only `github-actions[bot]`. The slug of the
+    board App is not in any configuration this repository reads (only secrets hold its credentials),
+    so the rule cannot be narrowed to it. A third-party App installed on the repository that creates
+    issues from user content could therefore plant a marker; install only Apps you trust.
 
     Anyone can open an issue in a public repository and paste a marker into it. Issues loaded by
     `load_issues` always carry `author` and `author_association`; an issue without either field

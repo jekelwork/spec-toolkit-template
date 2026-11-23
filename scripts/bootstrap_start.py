@@ -18,6 +18,7 @@ confirmation: previews and digests only read.
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -25,6 +26,7 @@ import os
 import re
 import shlex
 import subprocess
+import stat
 import sys
 import time
 from dataclasses import dataclass, field
@@ -504,6 +506,8 @@ def _confirm_command(env, step, digest, issue=None, named=False):
         parts.extend(_init_flags(env))
     if step["id"] == FIRST_SYNC and getattr(env.args, "full_dry_run", False):
         parts.append("--full-dry-run")
+    if step["id"] == PULL_REQUEST and getattr(env.args, "review_notes", False):
+        parts.append("--review-notes")  # the confirmed run recomputes the digest with the notes
     return " ".join(parts)
 
 
@@ -840,7 +844,7 @@ def _confirmed(env, args, value):
     return _perform(env, step, candidate), step_id  # (8)
 
 
-GUIDED_DONE = 'Done. Go back to your coding agent and reply "done".'
+GUIDED_DONE = "Done. Go back to your coding agent."
 GUIDED_FAILED = "Go back to your coding agent and tell it what happened."
 
 
@@ -1295,6 +1299,102 @@ PULL_REQUEST = "pull_request"
 # nothing else is added.
 COMMIT_MESSAGE = ISSUE_TITLE
 PUSH_COMMAND = ["git", "push", "-u", "origin", "HEAD"]
+NOTES_FILE = "bootstrap-review-notes.md"
+NOTES_IGNORE_ENTRY = f"/{NOTES_FILE}"
+NOTES_LIMIT = 60_000  # characters; GitHub's body limit is 65 536, the margin holds `Closes #<n>`
+# The body is one argument of `gh pr create`; Linux refuses an argument over 128 KiB (131 072
+# bytes), and multibyte text can pass the character limit while exceeding that.
+NOTES_BYTE_LIMIT = 100_000
+NOTES_DIGEST_KEY = "pull_request_notes_sha256"  # in `env.session`: the notes the digest covered
+
+
+class ReviewNotes:
+    """The validated review notes: where they are, their text and their SHA-256."""
+
+    def __init__(self, path, text, raw):
+        self.path, self.text = path, text
+        self.sha256 = hashlib.sha256(raw).hexdigest()
+
+
+# What the notes must not carry into a public pull request body (security audit T136, D21).
+# The error names the reason, never the match.
+CREDENTIAL_PATTERN = re.compile(
+    r"gh[pousr]_[A-Za-z0-9]|github_pat_[A-Za-z0-9]|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|AKIA[0-9A-Z]{16}")
+CLOSING_KEYWORD_PATTERN = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b(?::[ \t]*|[ \t]+)<?"
+    r"(?:(?:[\w.-]+/[\w.-]+)?#\d+"
+    r"|https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+)", re.I)
+# An @ mention anywhere: not preceded by a letter, digit or `.` (so not an email address),
+# followed by a user or team name.
+MENTION_PATTERN = re.compile(r"(?<![A-Za-z0-9.])@[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9._-]+)?")
+
+
+def _reason(error):
+    return error.strerror or type(error).__name__
+
+
+def _refuse_publishing_risks(text):
+    if CREDENTIAL_PATTERN.search(text):
+        raise ValueError(f"{NOTES_FILE} contains something that looks like a credential "
+                         "(a token, a private key header or an access key ID)")
+    for line in text.splitlines():
+        if CLOSING_KEYWORD_PATTERN.search(line):
+            raise ValueError(f"{NOTES_FILE} has a line with a closing keyword and an issue "
+                             "reference, which would close an issue when the pull request merges")
+        if MENTION_PATTERN.search(line):
+            raise ValueError(f"{NOTES_FILE} has an @ mention, which would notify someone")
+
+
+def read_review_notes(env):
+    """The review notes from the fixed file at the repository root, or a ValueError naming the
+    reason (never the content). Reads only; nothing is changed."""
+    try:
+        top = Path(_read(env, ["git", "rev-parse", "--show-toplevel"]))
+    except bootstrap_github.CommandError as error:
+        raise ValueError(f"the repository root could not be found ({error})") from error
+    path = top / NOTES_FILE
+    try:  # one open, no check-then-read: a link swapped in meanwhile is refused too
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # not on a pipe
+    except FileNotFoundError as error:
+        raise ValueError(f"{NOTES_FILE} is missing at the repository root ({top})") from error
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError(
+                f"{NOTES_FILE} is a symbolic link; it must be a regular file") from error
+        raise ValueError(f"{NOTES_FILE} cannot be read ({_reason(error)})") from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"{NOTES_FILE} is not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read(NOTES_BYTE_LIMIT + 1)  # bounded: a huge file is never read whole
+        if len(raw) > NOTES_BYTE_LIMIT:
+            raise ValueError(f"{NOTES_FILE} is longer than {NOTES_BYTE_LIMIT} bytes")
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{NOTES_FILE} cannot be read as UTF-8 text") from error
+    except OSError as error:
+        raise ValueError(f"{NOTES_FILE} cannot be read ({_reason(error)})") from error
+    finally:
+        os.close(descriptor)
+    if not text.strip():
+        raise ValueError(f"{NOTES_FILE} is empty")
+    if len(text) > NOTES_LIMIT:
+        raise ValueError(f"{NOTES_FILE} is longer than {NOTES_LIMIT} characters")
+    for char, name in (("\t", "a tab"), ("\r", "a carriage return (Windows line ending)")):
+        if char in text:
+            raise ValueError(f"{NOTES_FILE} contains {name}, which cannot be shown safely; "
+                             "use spaces and line feeds only")
+    if any(display_text.is_output_unsafe(char) for char in text if char != "\n"):
+        raise ValueError(f"{NOTES_FILE} contains a character that cannot be shown safely "
+                         "(a control or format character other than a line feed)")
+    _refuse_publishing_risks(text)
+    try:
+        env.run(["git", "check-ignore", "-q", NOTES_FILE], cwd=top)
+    except bootstrap_github.CommandError as error:
+        raise ValueError(f"Git does not ignore {NOTES_FILE}; add the line {NOTES_IGNORE_ENTRY} "
+                         "to .gitignore so it is never committed") from error
+    return ReviewNotes(path, text, raw)
 
 
 def _status_entries(status):
@@ -1444,8 +1544,34 @@ class PullRequestAction(StepAction):
     def commit_files(self, env, step):
         return self._plan(env)["own"]
 
+    @staticmethod
+    def _wants_notes(env):
+        return bool(getattr(env.args, "review_notes", False))
+
+    def _notes(self, env, plan):
+        """The review notes when `--review-notes` was given and the pull request is still to be
+        created, else None; a notes problem stops with exit 2 before anything is changed."""
+        if not (self._wants_notes(env) and plan["open"]):
+            return None
+        try:
+            return read_review_notes(env)
+        except ValueError as error:
+            raise StepFailed(f"{PULL_REQUEST} failed: {error}", EXIT_ERROR) from error
+
+    def invalid_values(self, env, step):
+        if not self._wants_notes(env):
+            return None
+        plan = self._plan(env)  # its own failures keep their exit code
+        try:
+            self._notes(env, plan)
+        except StepFailed as error:
+            return str(error).removeprefix(f"{PULL_REQUEST} failed: ")
+        return None
+
     def preview(self, env, step, candidate=None):
         plan = self._plan(env)
+        notes = self._notes(env, plan)
+        env.session[NOTES_DIGEST_KEY] = notes.sha256 if notes is not None else None
         lines = repository_head(env)
         if plan["clean_constitution"]:
             lines.append(SYNC_IMPACT_REPORT_LINE)
@@ -1456,19 +1582,33 @@ class PullRequestAction(StepAction):
             lines.append(f"Will push the branch with `{' '.join(PUSH_COMMAND)}`.")
         if plan["open"]:
             lines.append(f"Will open a pull request that closes #{plan['issue']}.")
+        if notes is not None:
+            lines.append(f"Will add these review notes from {_printable(str(notes.path))} to the "
+                         "pull request body:")
+            lines.extend(f"  | {line}".rstrip() for line in notes.text.splitlines())
+        elif self._wants_notes(env) and not plan["open"]:
+            lines.append("The pull request already exists; the review notes are not added.")
         if plan["others"]:
             lines.append("Other changed files, not committed: "
                          f"{_printable(', '.join(plan['others']))}")
         files = self._contained(env, plan)
         if files:
             lines.append(f"The pull request will contain: {_printable(', '.join(files))}")
-        return lines
+        if notes is None:
+            return lines
+        shown = PreviewLines(lines)
+        shown.digest_lines = [*lines, f"Review notes SHA-256: {notes.sha256}"]
+        return shown
 
     def perform(self, env, step, candidate=None):
         plan = self._plan(env)
         if not (plan["commit"] or plan["push"] or plan["open"]):
             raise StepFailed(f"{PULL_REQUEST} failed: nothing to commit, push or open",
                              EXIT_STOPPED)
+        notes = self._notes(env, plan)  # read again, before anything is changed
+        if notes is not None and notes.sha256 != env.session.get(NOTES_DIGEST_KEY):
+            raise StepFailed(CHANGED, EXIT_CHANGED)  # edited since the digest was checked
+        body = f"Closes #{plan['issue']}" + (f"\n\n{notes.text}" if notes else "")
         done = []
         cleaned = _cleaned_constitution(env) if plan["clean_constitution"] else None
         if cleaned is not None:  # None: the file changed since the plan; leave it alone
@@ -1494,7 +1634,7 @@ class PullRequestAction(StepAction):
                 created = env.run(
                     ["gh", "pr", "create", "--repo", env.repo(), "--head", plan["branch"],
                      "--base", env.default_branch, "--title", COMMIT_MESSAGE,
-                     "--body", f"Closes #{plan['issue']}"], cwd=env.root)
+                     "--body", body], cwd=env.root)
                 done.append("opened")
         except bootstrap_github.CommandError as error:
             earlier = (f" (already {' and '.join(done)}; rerunning start does the rest)"
@@ -1906,6 +2046,9 @@ def build_parser(prog="bootstrap.py start"):
                              "end with a line for the coding agent that guides you")
     parser.add_argument("--full-dry-run", action="store_true",
                         help="show the whole dry run of the first sync, not only its summary")
+    parser.add_argument("--review-notes", action="store_true",
+                        help="add the notes in bootstrap-review-notes.md at the repository root "
+                             "to the body of the bootstrap pull request")
     parser.add_argument("--agents", metavar="TOOL,...",
                         help="save the coding agents you use (comma-separated: "
                              f"{', '.join(agent_setup.TOOLS)}) and generate their files")

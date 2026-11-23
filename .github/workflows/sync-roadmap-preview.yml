@@ -1,0 +1,194 @@
+name: Preview Roadmap Sync
+
+# A dry run of the roadmap sync for pull requests that change what it reads, so the issue changes a
+# merge will apply are visible before the merge.
+#
+# What runs: the scripts come from the base branch, not from the pull request. The code is the first
+# parent of the merge commit (github.sha, refs/pull/N/merge, which exists only while the pull request
+# merges cleanly), and only the roadmap and specs (ROADMAP.md and specs/, which are data) are taken
+# from the merge commit itself. The summary says when the pull request changes any other file.
+#
+# Who can change what runs: pull requests from forks run this workflow file as it is on the base
+# branch, so they cannot change what runs. For a pull request from the same repository, GitHub runs
+# the pull request's own copy of this workflow file: review changes to .github/ and scripts/ before
+# trusting the preview. The read-only token below (it reads issues, pull requests and contents) is
+# acceptable for that reason: it can read what the repository already shows and write nothing.
+#
+# It never applies anything, uses no secret and no board credential, and runs on the plain pull
+# request event, never the privileged target event. Pull requests from forks get the job summary only.
+# The comment job takes only text from the preview job; it writes the marker and the code fence itself
+# and neutralises mentions and markup, because the text contains titles from the pull request.
+
+on:
+  pull_request:
+    # Keep these paths in step with sync-roadmap-issues.yml.
+    paths:
+      - ROADMAP.md
+      - specs/*/spec.md
+      - specs/*/plan.md
+      - specs/*/tasks.md
+
+permissions: {}
+
+jobs:
+  preview:
+    if: github.event.pull_request.base.ref == github.event.repository.default_branch
+    concurrency:
+      group: issue-sync-preview-pr-${{ github.event.pull_request.number }}
+      # A newer push to the pull request makes an older preview stale; the job only reads.
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    # pull-requests: the dry run lists open pull requests (to tell a Phase in review) when entries
+    # are closed, deferred or removed.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      body: ${{ steps.dry-run.outputs.body }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The default ref: the merge commit (github.sha). The next step switches the code to its
+          # first parent, the base branch tip the pull request merges into.
+          persist-credentials: false
+
+      - name: Take the roadmap and specs from the merge commit
+        id: take
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          # The first parent of the merge commit is the base the merge result was built on. Reading it
+          # from the commit object works on a depth-1 checkout. Only the header is read (it ends at the
+          # first empty line), so the message cannot supply a parent, and GitHub's test merge commit
+          # always has exactly two parents.
+          commit=$(git cat-file -p "$SOURCE_SHA")
+          parents=$(awk '/^$/ { exit } /^parent / { print $2 }' <<< "$commit")
+          if [[ $(grep -c . <<< "$parents") -ne 2 ]]; then
+            echo "::error::$SOURCE_SHA is not a merge commit with two parents." >&2
+            exit 1
+          fi
+          PARENT_SHA=$(head -n 1 <<< "$parents")
+          if [[ "$PARENT_SHA" != "$BASE_SHA" ]]; then
+            echo "::warning::The base branch moved since the pull request event; the preview uses $PARENT_SHA."
+          fi
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" fetch --no-tags --depth=1 origin "$PARENT_SHA"
+          # A link could point at a file outside the checkout; refuse them rather than follow them.
+          # The pathspecs have no trailing slash, so a top-level link named `specs` is found too.
+          links=$(git ls-tree -r "$SOURCE_SHA" -- ROADMAP.md specs | awk -F'\t' '{ split($1, a, " "); if (a[1] == "120000") print $2 }')
+          if [[ -n "$links" ]]; then
+            echo "::error::ROADMAP.md and specs/ must not contain symbolic links; found: $(echo "$links" | tr '\n' ' ')" >&2
+            exit 1
+          fi
+          # Every changed path outside the roadmap and specs (renames count as old and new path). The
+          # diff is captured first, not piped into grep -q, so a closed pipe cannot change the result.
+          changed=$(git -c core.quotePath=false diff --no-renames --name-only "$PARENT_SHA" "$SOURCE_SHA")
+          if [[ -n "$(grep -Ev '^(ROADMAP\.md$|specs/)' <<< "$changed")" ]]; then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The code is the first parent's tree; the data below comes from the merge commit.
+          git checkout --detach "$PARENT_SHA"
+          # A commit without one of the paths (a bootstrap pull request has neither) is not an error:
+          # the base copy is dropped and nothing is taken.
+          for path in ROADMAP.md specs; do
+            rm -rf "$path"
+            if git cat-file -e "$SOURCE_SHA:$path" 2> /dev/null; then
+              git checkout "$SOURCE_SHA" -- "$path"
+            fi
+          done
+          if test -L specs || test -L ROADMAP.md; then
+            echo "::error::ROADMAP.md and specs must not be symbolic links." >&2
+            exit 1
+          fi
+
+      - name: Preview the roadmap sync
+        id: dry-run
+        env:
+          # The dry run reads issues and pull requests with gh, which needs a token in Actions.
+          GH_TOKEN: ${{ github.token }}
+          PYTHONUNBUFFERED: '1'
+          CODE_CHANGED: ${{ steps.take.outputs.code_changed }}
+          AUTO_APPLY: ${{ vars.ROADMAP_SYNC_AUTO_APPLY }}
+        run: |
+          flags=(--board-skipped)
+          if [[ "$CODE_CHANGED" == "true" ]]; then
+            flags+=(--code-changed)
+          fi
+          set +e
+          python3 scripts/sync-roadmap-issues.py --skip-project --report-sync-state > "$RUNNER_TEMP/dry-run.txt" 2>&1
+          code=$?
+          set -e
+          cat "$RUNNER_TEMP/dry-run.txt"
+          # Drop any line a Markdown parser could take for a code fence (up to three spaces, three or more tildes).
+          python3 scripts/roadmap_sync_summary.py "$RUNNER_TEMP/dry-run.txt" \
+            --exit-code "$code" --auto-apply "$AUTO_APPLY" "${flags[@]}" \
+            | sed -E -e '/^ {0,3}~{3,}/d' > "$RUNNER_TEMP/summary.txt"
+          # The text holds titles from the pull request: show it only inside a fence written here.
+          {
+            echo '~~~~text'
+            cat "$RUNNER_TEMP/summary.txt"
+            echo '~~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A random delimiter, so the text of the pull request cannot end the output early.
+          delimiter="EOF_$(openssl rand -hex 16)"
+          {
+            echo "body<<$delimiter"
+            cat "$RUNNER_TEMP/summary.txt"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+  comment:
+    needs: preview
+    # Same-repository pull requests only: a fork's token cannot write, and its text stays in the summary.
+    if: ${{ !cancelled() && needs.preview.outputs.body != '' && github.event.pull_request.head.repo.full_name == github.repository }}
+    concurrency:
+      group: issue-sync-preview-pr-${{ github.event.pull_request.number }}-comment
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Create or update the preview comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ github.sha }}
+          BODY: ${{ needs.preview.outputs.body }}
+        run: |
+          marker='<!-- roadmap-sync-preview -->'
+          lt=$'\xe2\x80\xb9'
+          zwsp=$'\xe2\x80\x8b'
+          # This job, not the preview, writes the marker and the fence. Inside the fence the text loses
+          # `<`, every `@` mention, any line a Markdown parser could take for a fence (up to three
+          # spaces, three or more tildes), and everything past the length cap.
+          {
+            echo "$marker"
+            echo "### Roadmap sync preview"
+            echo
+            echo "Preview of the merge commit \`$MERGE_SHA\` (pull request head \`$HEAD_SHA\`). A rerun updates this comment."
+            echo
+            echo '~~~~text'
+            printf '%s\n' "$BODY" \
+              | sed -E -e '/^ {0,3}~{3,}/d' -e "s/</$lt/g" -e "s/@/@$zwsp/g" \
+              | awk -v max=50000 '{ n += length($0) + 1; if (n > max) { print "(truncated; see the job log for the full output)"; exit } print }'
+            echo '~~~~'
+          } > "$RUNNER_TEMP/body.md"
+          # Only the Actions bot's own comment is updated, so a pasted marker cannot redirect the edit.
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"$marker\"))) | .id" \
+            | sed -n '1p')
+          if [[ -n "$id" ]]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@"$RUNNER_TEMP/body.md" > /dev/null
+            echo "Updated comment $id."
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@"$RUNNER_TEMP/body.md" > /dev/null
+            echo "Created the preview comment."
+          fi

@@ -1238,6 +1238,16 @@ class CredentialsTest(GitHubTestCase):
         _, _, out, _ = self.report([])
         self.assertNotIn("PHASE_SYNC_AUTO_APPLY", out)
 
+    def test_roadmap_auto_apply_variable_is_reported_only_when_set(self):
+        line = ("ROADMAP_SYNC_AUTO_APPLY: set "
+                "(the roadmap sync applies on merge unless its value is false in any case; "
+                "any other value except true fails the push run)")
+        _, _, out, _ = self.report([], ["ROADMAP_SYNC_AUTO_APPLY"])
+        self.assertIn(line, out)
+        self.assertNotIn("PHASE_SYNC_AUTO_APPLY", out)
+        _, _, out, _ = self.report([])
+        self.assertNotIn("ROADMAP_SYNC_AUTO_APPLY", out)
+
     def test_missing_credentials_are_not_drift_and_values_are_never_read(self):
         run = FakeGitHub()
         self.github(run, "--apply")

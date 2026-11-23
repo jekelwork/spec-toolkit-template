@@ -16,12 +16,17 @@ handed a list of findings to decide on a first constitution and roadmap:
 
 - The agent fixes the review's Critical and Required findings itself through the skills
   (`speckit-constitution` for the constitution, `roadmap-write` for the roadmap), and in the first
-  round also its Optional and Nit findings where feasible.
-- A second round fixes only Critical and Required findings and drops the rest. The dropped findings
-  are named as dropped, not handed to the user to decide.
+  round also its Optional and Nit findings where feasible, without asking, and reports them in one
+  line.
+- A second round fixes only Critical and Required findings and drops the rest.
 - A finding whose fix would change what the constitution or roadmap decides is still asked of the
-  user: those decisions stay with the user.
-- FYI findings are still reported to the user as information; no decision is asked.
+  user, together in one multi-select question: those decisions stay with the user.
+- No other finding is handed to the user to decide: dropped and FYI findings are counted in the
+  chat and listed in the pull request body. The agent writes them, one line each under
+  `## Review notes`, to
+  `bootstrap-review-notes.md` at the repository root (the only file it writes outside the skills;
+  Git ignores it) and passes `--review-notes` to the `pull_request` step. With none of them, there
+  is no notes file and no flag.
 - `security-auditor` findings are not covered by this exception: Critical and High findings are
   fixed and the others relayed as usual.
 - The rule that every finding is relayed to the user applies again after the bootstrap, for every

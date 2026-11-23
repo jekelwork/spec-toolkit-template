@@ -400,7 +400,7 @@ def build_parser():
     commands.add_parser(
         "start",
         help="work through the bootstrap steps: start [--no-input] "
-        "[--agents TOOL,...] [--full-dry-run] "
+        "[--agents TOOL,...] [--full-dry-run] [--review-notes] "
         "[--confirm STEP_ID@DIGEST [--issue N] [--guided]] [init flags]",
         add_help=False,
     )

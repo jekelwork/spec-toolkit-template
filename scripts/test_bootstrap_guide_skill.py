@@ -428,6 +428,18 @@ class GuardTest(unittest.TestCase):
             text = self.broken(f"`python3 scripts/bootstrap.py start --no-input --confirm {bad}`")
             self.assertTrue(check_start_and_confirm(text, self.names["ids"]), bad)
 
+    def test_review_notes_flag_is_accepted_on_the_confirming_command(self):
+        # research D21: the notes flag goes to the pull_request preview and the confirming command
+        command = ("python3 scripts/bootstrap.py start --no-input --confirm "
+                   "<step-id>@<digest> --review-notes --guided")
+        for text in (self.broken(f"`{command}`"), self.broken(f"```text\n! {command}\n```"),
+                     self.broken("`python3 scripts/bootstrap.py start --no-input --review-notes`")):
+            self.assertEqual([], check_commands(text, self.options))
+            self.assertEqual([], check_exit_suffix(text))
+            self.assertEqual([], check_start_and_confirm(text, self.names["ids"]))
+            self.assertEqual([], check_fenced_command_lines(text))
+        self.assertEqual([], check_flags(self.broken("`--review-notes`"), self.options))
+
     def test_exit_suffix_is_the_only_thing_allowed_after_a_command(self):
         self.assertEqual([], check_exit_suffix(self.text))
         for good in (f"`python3 scripts/bootstrap.py check --json{EXIT_SUFFIX}`",

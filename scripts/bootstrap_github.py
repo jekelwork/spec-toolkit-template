@@ -620,6 +620,12 @@ def report_credentials(repo, run):
                          f"{' and '.join(APP_SECRETS)} (see {CREDENTIALS_GUIDE})")
     if variables is not None and "PHASE_SYNC_AUTO_APPLY" in variables:
         lines.append("PHASE_SYNC_AUTO_APPLY: set (Phase issues sync without a dry-run review)")
+    if variables is not None and "ROADMAP_SYNC_AUTO_APPLY" in variables:
+        lines.append(
+            "ROADMAP_SYNC_AUTO_APPLY: set "
+            "(the roadmap sync applies on merge unless its value is false in any case; "
+            "any other value except true fails the push run)"
+        )
     return lines
 
 

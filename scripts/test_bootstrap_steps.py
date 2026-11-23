@@ -1348,6 +1348,33 @@ class BoardCredentialTest(unittest.TestCase):
         self.assertEqual([], step.details["secrets"])
         self.assertNotIn("UNRELATED", json.dumps(step.details))
 
+    def test_not_configured_gives_the_command_to_set_the_token_secret(self):
+        expected = f"gh secret set {bootstrap_github.TOKEN_SECRET} -R acme/widgets"
+        for org in (None, ["UNRELATED_ORG"]):
+            with self.subTest(organization_secrets=org):
+                step = self.detect(secret_world(["UNRELATED"], org_secrets=org))
+                self.assertEqual(expected, step.action["command"])
+        run = secret_world(["UNRELATED"])
+        run.rules[2] = (run.rules[2][0], gh_error("HTTP 403: forbidden"))
+        self.assertEqual(expected, self.detect(run).action["command"])
+
+    def test_the_secret_command_quotes_the_repository(self):
+        step = bootstrap_steps.detect_board_credential("ac me/widgets", Scripted(
+            (["gh", "secret", "list"], "[]"), (["gh", "api"], json.dumps({"secrets": []}))))
+
+        self.assertEqual(f"gh secret set {bootstrap_github.TOKEN_SECRET} -R 'ac me/widgets'",
+                         step.action["command"])
+
+    def test_the_title_of_a_not_configured_credential_is_unchanged(self):
+        step = self.detect(secret_world(["UNRELATED"]))
+
+        self.assertEqual("Board credential not configured (optional)", step.title)
+
+    def test_an_incomplete_app_keeps_a_null_command(self):
+        step = self.detect(secret_world([bootstrap_github.APP_SECRETS[0]]))
+
+        self.assertIsNone(step.action["command"])
+
     def test_half_an_app_is_optional_and_names_the_missing_part(self):
         step = self.detect(secret_world([bootstrap_github.APP_SECRETS[0]]))
 
@@ -2075,6 +2102,33 @@ class MergeStepTest(unittest.TestCase):
         self.assertEqual(["lint", "legacy"], step.details["failing_checks"])
         self.assertEqual(5, step.details["pull_request"]["number"])
         self.assertIsNotNone(step.action)
+
+    def test_a_waiting_merge_gives_the_command_to_update_the_default_branch(self):
+        step = self.detect(self.found(pr()), context(False, default="main"))
+
+        self.assertEqual("Review and merge PR #5 on GitHub, then run the command below.",
+                         step.action["text"])
+        self.assertEqual("git switch main && git pull --ff-only origin main",
+                         step.action["command"])
+
+    def test_the_merge_command_quotes_the_default_branch(self):
+        step = self.detect(self.found(pr()), context(False, default="re lease"))
+
+        self.assertEqual("git switch 're lease' && git pull --ff-only origin 're lease'",
+                         step.action["command"])
+
+    def test_a_default_branch_with_an_unsafe_character_gives_no_merge_command(self):
+        step = self.detect(self.found(pr()), context(False, default=f"rel{BIDI}ease"))
+
+        self.assertIsNone(step.action["command"])
+        self.assertIn("cannot be shown safely", step.action["text"])
+
+    def test_an_unknown_default_branch_gives_no_merge_command(self):
+        step = self.detect(self.found(pr()), context(False, default=None))
+
+        self.assertEqual("waiting", step.state)
+        self.assertIsNone(step.action["command"])
+        self.assertEqual("Review and merge PR #5 on GitHub.", step.action["text"])
 
     def test_failing_check_names_are_listed_once(self):
         checks = [{"name": "lint", "conclusion": "FAILURE"},
