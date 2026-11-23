@@ -89,7 +89,7 @@ python3 scripts/agent_setup.py check
 
 ## Agent personas and skills from agent-skills
 
-Review and engineering personas come from [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills). `npx skills` installs skills only, so the two parts are managed differently:
+Review and engineering personas come from [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills); the full sub-agent list, including the local ones, is in the [roster](sub-agents.md#roster). `npx skills` installs skills only, so the two parts are managed differently:
 
 | What                                                                                       | Where                                                                                                                                   | How to update                                                                                                                                 |
 | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |

@@ -1,6 +1,8 @@
 from pathlib import Path
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -748,6 +750,582 @@ class BoardCredentialTest(unittest.TestCase):
         text = workflow_text("sync-project-status.yml")
         self.assertIn("persist-credentials: false", text)
         self.assertIn("github.event.pull_request.base.sha", text)
+
+
+PREVIEW = "sync-roadmap-preview.yml"
+
+
+def job_block(workflow, job):
+    text = "\n" + workflow_text(workflow).split("\njobs:\n")[1]
+    return re.split(r"(?m)^  \w[\w-]*:\n", text.split(f"\n  {job}:\n")[1])[0]
+
+
+class RoadmapAutoApplyTest(unittest.TestCase):
+    """A push to the default branch applies the roadmap sync once the first sync has run."""
+
+    def group(self, event, apply="", variable=""):
+        expression = re.search(
+            r"^      group: (.*)$", workflow_text("sync-roadmap-issues.yml"), re.MULTILINE
+        ).group(1)
+        context = {"github.event_name": event, "inputs.apply": apply, "vars.ROADMAP_SYNC_AUTO_APPLY": variable}
+        return evaluate(expression, context)
+
+    def test_applying_runs_use_the_roadmap_group_and_previews_do_not(self):
+        cases = (
+            ("push", "", "", "issue-sync-roadmap"),
+            ("push", "", "true", "issue-sync-roadmap"),
+            ("push", "", "TRUE", "issue-sync-roadmap"),
+            ("push", "", "false", "issue-sync-preview"),
+            ("push", "", "False", "issue-sync-preview"),
+            ("push", "", "FALSE", "issue-sync-preview"),
+            # Padded: the group cannot trim, and the step rejects it, so the run fails either way.
+            ("push", "", " false ", "issue-sync-roadmap"),
+            ("workflow_dispatch", True, "", "issue-sync-roadmap"),
+            ("workflow_dispatch", False, "", "issue-sync-preview"),
+            ("schedule", "", "", "issue-sync-preview"),
+        )
+        for event, apply, variable, expected in cases:
+            with self.subTest(event=event, apply=apply, variable=variable):
+                self.assertEqual(expected, self.group(event, apply, variable))
+
+    def test_one_merge_never_queues_two_jobs_in_one_single_slot_group(self):
+        # A merge of a pull request that changes tasks.md starts the roadmap sync (push) and the
+        # Phase sync (closed pull request). A concurrency group holds one running and one pending
+        # job, so two jobs of one merge in one group would drop a run.
+        roadmap = self.group("push", "", "")
+        phase_text = workflow_text("sync-phase-issues.yml")
+        expression = " ".join(
+            re.search(r"group: >-\n((?:        .*\n)+)", phase_text).group(1).split()
+        )
+        phase = evaluate(
+            expression,
+            {
+                "github.event_name": "pull_request",
+                "inputs.apply": "",
+                "vars.PHASE_SYNC_AUTO_APPLY": "",
+            },
+        )
+        self.assertNotEqual(roadmap, phase)
+        self.assertNotIn("issue-sync-preview", (roadmap, phase))
+
+    def test_the_groups_are_documented_as_safe_to_run_side_by_side(self):
+        text = workflow_text("sync-roadmap-issues.yml")
+        self.assertIn("idempotent", text)
+        self.assertIn("marker", text)
+
+    def run_sync_step(self, event, auto_apply="", apply_requested="false", board="token"):
+        script = step_script(
+            "Synchronize roadmap issues", WORKFLOWS / "sync-roadmap-issues.yml"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory, "bin")
+            bin_dir.mkdir()
+            stub = bin_dir / "python3"
+            stub.write_text('#!/bin/sh\necho "python3 $*"\n', encoding="utf-8")
+            stub.chmod(0o755)
+            env = {
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "GITHUB_EVENT_NAME": event,
+                "AUTO_APPLY": auto_apply,
+                "APPLY_REQUESTED": apply_requested,
+                "BOARD_GH_TOKEN": board,
+            }
+            return subprocess.run(
+                ["bash", "-e", "-c", script], env=env, capture_output=True, text=True, cwd=directory
+            )
+
+    def test_a_push_applies_unless_the_switch_is_false_in_any_case(self):
+        for value in ("", "true", "TRUE", "True"):
+            with self.subTest(value=value):
+                result = self.run_sync_step("push", value)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertIn("--apply-if-synced", result.stdout)
+        for value in ("false", "False", "FALSE"):
+            with self.subTest(value=value):
+                result = self.run_sync_step("push", value)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertNotIn("--apply", result.stdout)
+                self.assertIn("Automatic apply is off", result.stdout)
+
+    def test_any_other_switch_value_fails_a_push_run_with_a_clear_error(self):
+        # Expressions cannot trim, so a padded value is invalid in bash too: both agree.
+        for value in ("yes", "0", "off", "falsey", " false ", " true "):
+            with self.subTest(value=value):
+                result = self.run_sync_step("push", value)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("ROADMAP_SYNC_AUTO_APPLY must be true or false", result.stderr)
+                self.assertNotIn("python3", result.stdout)
+
+    def test_schedule_never_applies_and_the_manual_input_is_unchanged(self):
+        for value in ("", "false", "nonsense"):
+            result = self.run_sync_step("schedule", value)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertNotIn("--apply", result.stdout)
+        manual = self.run_sync_step("workflow_dispatch", "false", apply_requested="true")
+        self.assertIn("--apply", manual.stdout)
+        self.assertNotIn("--apply-if-synced", manual.stdout)
+        preview = self.run_sync_step("workflow_dispatch", "", apply_requested="false")
+        self.assertNotIn("--apply", preview.stdout)
+
+    def test_the_workflow_never_cancels_a_running_sync(self):
+        self.assertIn("cancel-in-progress: false", workflow_text("sync-roadmap-issues.yml"))
+        self.assertNotIn("cancel-in-progress: true", workflow_text("sync-roadmap-issues.yml"))
+
+
+class RoadmapPreviewWorkflowTest(unittest.TestCase):
+    """Pull requests that change the roadmap or specs get a dry run, never an apply."""
+
+    def test_it_runs_on_pull_requests_and_never_on_pull_request_target(self):
+        text = workflow_text(PREVIEW)
+        head = text.split("\njobs:\n")[0]
+        self.assertRegex(head, r"(?m)^  pull_request:$")
+        self.assertNotIn("pull_request_target", text)
+        for path in ("ROADMAP.md", "specs/*/spec.md", "specs/*/plan.md", "specs/*/tasks.md"):
+            self.assertIn(f"      - {path}\n", head)
+
+    def test_the_watched_paths_match_the_apply_workflow(self):
+        def paths(workflow):
+            head = workflow_text(workflow).split("\njobs:\n")[0]
+            return re.findall(r"(?m)^      - (ROADMAP\.md|specs/\S+)$", head)
+
+        self.assertEqual(paths("sync-roadmap-issues.yml"), paths(PREVIEW))
+
+    def test_the_preview_job_only_targets_the_default_branch(self):
+        condition = re.search(r"^    if: (.*)$", job_block(PREVIEW, "preview"), re.MULTILINE).group(1)
+        for base, runs in (("main", True), ("feature", False)):
+            context = {
+                "github.event.pull_request.base.ref": base,
+                "github.event.repository.default_branch": "main",
+            }
+            with self.subTest(base=base):
+                self.assertEqual(bool(evaluate(condition, context)), runs)
+
+    def test_the_preview_job_is_read_only_and_has_no_secrets_or_board_credential(self):
+        job = job_block(PREVIEW, "preview")
+        # The dry run lists open pull requests (to tell a Phase in review) for closing entries.
+        self.assertIn(
+            "permissions:\n      contents: read\n      issues: read\n      pull-requests: read\n", job
+        )
+        self.assertNotIn("write", job.split("steps:")[0])
+        self.assertNotIn("secrets.", job)
+        self.assertNotIn("board-token", job)
+        self.assertNotIn("BOARD_GH_TOKEN", job)
+        self.assertIn("persist-credentials: false", job)
+        self.assertIn("--skip-project", job)
+        self.assertNotIn("--apply", job)
+        self.assertIn("$GITHUB_STEP_SUMMARY", job)
+
+    def test_the_dry_run_step_gives_gh_the_job_token(self):
+        # sync-roadmap-issues.py calls `gh api`; without GH_TOKEN, gh stops in GitHub Actions (#120).
+        self.assertEqual(
+            "${{ github.token }}",
+            env_expression(PREVIEW, "Preview the roadmap sync", "GH_TOKEN"),
+        )
+
+    def test_the_preview_workflow_is_wired_to_the_merge_commit_and_the_base_scripts(self):
+        job = job_block(PREVIEW, "preview")
+        # The checkout is the merge commit; the step reads its first parent and checks that out. The
+        # event's base SHA is only compared with that parent, for a warning; nothing checks it out.
+        self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha }}", job)
+        self.assertEqual(2, job.count("BASE_SHA"))
+        self.assertIn('git checkout --detach "$PARENT_SHA"', job)
+        self.assertIn("SOURCE_SHA: ${{ github.sha }}", job)
+        self.assertNotIn("HEAD_SHA", job)
+        self.assertIn('git -c "http.https://github.com/.extraheader=', job)
+        self.assertIn('fetch --no-tags --depth=1 origin "$PARENT_SHA"', job)
+        # No fallback: the merge commit is already checked out, and only the parent is fetched.
+        self.assertNotIn("refs/pull/", job)
+        self.assertNotIn("PR_NUMBER", job)
+        self.assertIn("--report-sync-state", job)
+        self.assertIn("AUTO_APPLY: ${{ vars.ROADMAP_SYNC_AUTO_APPLY }}", job)
+        self.assertIn('--auto-apply "$AUTO_APPLY"', job)
+        self.assertIn("CODE_CHANGED: ${{ steps.take.outputs.code_changed }}", job)
+        # The data is taken before the dry run, which runs the base branch's script.
+        self.assertLess(job.index("git checkout"), job.index("sync-roadmap-issues.py"))
+
+    def test_the_diff_is_captured_before_it_is_searched(self):
+        # Nothing pipes git diff into grep -q: a closed pipe could turn the result into "false".
+        script = step_script("Take the roadmap and specs from the merge commit", WORKFLOWS / PREVIEW)
+        self.assertNotRegex(script, r"diff[^\n]*\|")
+        self.assertIn("^(ROADMAP\\.md$|specs/)", script)
+        self.assertIn("test -L", script)
+        self.assertIn("-- ROADMAP.md specs |", script)  # a pathspec without a trailing slash
+
+    def test_the_header_explains_what_runs_and_who_can_change_it(self):
+        head = workflow_text(PREVIEW).split("\njobs:\n")[0]
+        self.assertIn("base branch", head)
+        self.assertIn("read-only token", head)
+        self.assertIn("merge commit", head)
+        self.assertIn("only the roadmap and specs", head)
+        # Same-repository pull requests run their own copy of this workflow file.
+        self.assertIn("same repository", head)
+        self.assertIn("review changes to .github/ and scripts/", head)
+        self.assertIn("cannot change what runs", head)
+        self.assertNotIn("A pull request cannot change what runs", head)
+
+    # -- the step that takes the data from the merge commit, run against real git repositories --
+
+    def git(self, cwd, *args):
+        result = subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", *args],
+            cwd=cwd, capture_output=True, text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        return result.stdout.strip()
+
+    def commit(self, work, files, remove=(), symlinks=None):
+        for name in remove:
+            path = Path(work, name)
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+        for name, text in files.items():
+            path = Path(work, name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        for name, target in (symlinks or {}).items():
+            path = Path(work, name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(target, path)
+        self.git(work, "add", "-A")
+        self.git(work, "commit", "-m", "c", "--allow-empty")
+        return self.git(work, "rev-parse", "HEAD")
+
+    def take_step(self, make_source, as_merge=True, base_sha=None):
+        """Run the step on a clone at the base commit; `make_source(work)` builds the source commit.
+
+        Like GitHub's test merge commit, a single-parent source is wrapped in a merge commit with the
+        base as first parent and the source as second, unless `as_merge` is false.
+        """
+        script = step_script("Take the roadmap and specs from the merge commit", WORKFLOWS / PREVIEW)
+        with tempfile.TemporaryDirectory() as directory:
+            origin = Path(directory, "origin.git")
+            subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+            self.git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+            work = Path(directory, "work")
+            work.mkdir()
+            self.git(work, "init", "-q")
+            base = self.commit(
+                work,
+                {
+                    "ROADMAP.md": "base roadmap",
+                    "specs/old/spec.md": "base spec",
+                    "scripts/tool.py": "base script",
+                    ".github/workflows/w.yml": "base workflow",
+                    "project-context.toml": "base context",
+                },
+            )
+            self.git(work, "remote", "add", "origin", str(origin))
+            source = make_source(work)
+            parents = self.git(work, "rev-list", "--parents", "-n", "1", source).split()[1:]
+            if as_merge and len(parents) == 1:
+                tree = self.git(work, "rev-parse", f"{source}^{{tree}}")
+                source = self.git(work, "commit-tree", tree, "-p", base, "-p", source, "-m", "merge")
+            self.git(work, "push", "-q", "origin", f"{source}:refs/pull/7/merge", f"{base}:refs/heads/main")
+            # What actions/checkout leaves: a depth-1 checkout of the merge commit, parents not fetched.
+            clone = Path(directory, "clone")
+            clone.mkdir()
+            self.git(clone, "init", "-q")
+            self.git(clone, "remote", "add", "origin", str(origin))
+            self.git(clone, "fetch", "-q", "--no-tags", "--depth=1", "origin", source)
+            self.git(clone, "checkout", "-q", "--detach", source)
+            output = Path(directory, "github_output")
+            output.write_text("", encoding="utf-8")
+            env = {
+                "PATH": os.environ["PATH"],
+                "HOME": directory,
+                "GH_TOKEN": "t",
+                "SOURCE_SHA": source,
+                "BASE_SHA": base_sha or base,
+                "GITHUB_OUTPUT": str(output),
+            }
+            result = subprocess.run(["bash", "-e", "-c", script], env=env, cwd=clone, capture_output=True, text=True)
+            files = {
+                str(p.relative_to(clone)): p.read_text(encoding="utf-8")
+                for p in clone.rglob("*")
+                if p.is_file() and not p.is_symlink() and ".git" not in p.relative_to(clone).parts
+            }
+            return result, files, output.read_text(encoding="utf-8")
+
+    def test_the_step_takes_the_roadmap_and_specs_from_the_merge_commit_only(self):
+        def source(work):
+            return self.commit(
+                work,
+                {
+                    "ROADMAP.md": "merged roadmap",
+                    "specs/new/spec.md": "merged spec",
+                    "scripts/tool.py": "evil script",
+                    ".github/workflows/w.yml": "evil workflow",
+                },
+                remove=("specs/old",),
+            )
+
+        result, files, output = self.take_step(source)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("merged roadmap", files["ROADMAP.md"])
+        self.assertEqual("merged spec", files["specs/new/spec.md"])
+        self.assertNotIn("specs/old/spec.md", files)  # deleted by the pull request
+        self.assertEqual("base script", files["scripts/tool.py"])
+        self.assertEqual("base workflow", files[".github/workflows/w.yml"])
+        self.assertIn("code_changed=true", output)
+
+    def test_the_code_comes_from_the_first_parent_of_the_merge_commit(self):
+        def source(work):
+            base = self.git(work, "rev-parse", "HEAD")
+            side = self.commit(
+                work, {"scripts/tool.py": "head script", "ROADMAP.md": "merged roadmap"}
+            )
+            tree = self.git(work, "rev-parse", f"{side}^{{tree}}")
+            return self.git(work, "commit-tree", tree, "-p", base, "-p", side, "-m", "merge")
+
+        result, files, output = self.take_step(source)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("base script", files["scripts/tool.py"])  # the first parent, not the head
+        self.assertEqual("merged roadmap", files["ROADMAP.md"])  # data from the merge commit
+        self.assertIn("code_changed=true", output)
+
+    def test_a_source_that_is_not_a_two_parent_merge_commit_is_refused(self):
+        def source(work):
+            return self.commit(work, {"ROADMAP.md": "merged roadmap"})
+
+        result, _, _ = self.take_step(source, as_merge=False)
+        self.assertEqual(1, result.returncode)
+        self.assertIn("is not a merge commit with two parents", result.stderr)
+
+    def test_a_parent_line_in_the_commit_message_is_not_read(self):
+        def source(work):
+            base = self.git(work, "rev-parse", "HEAD")
+            tree = self.git(work, "rev-parse", f"{base}^{{tree}}")
+            return self.git(work, "commit-tree", tree, "-p", base, "-m", f"x\n\nparent {base}")
+
+        result, _, _ = self.take_step(source, as_merge=False)
+        self.assertEqual(1, result.returncode)
+        self.assertIn("is not a merge commit with two parents", result.stderr)
+
+    def test_a_moved_base_is_reported_as_a_warning(self):
+        def source(work):
+            return self.commit(work, {"ROADMAP.md": "merged roadmap"})
+
+        result, files, _ = self.take_step(source, base_sha="0" * 40)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("::warning::The base branch moved", result.stdout)
+        self.assertEqual("merged roadmap", files["ROADMAP.md"])
+
+    def test_a_source_commit_without_specs_or_roadmap_is_not_an_error(self):
+        # The normal state of a bootstrap pull request: neither path exists in the source commit.
+        for removed in (("specs",), ("ROADMAP.md",), ("specs", "ROADMAP.md")):
+            with self.subTest(removed=removed):
+                result, files, _ = self.take_step(
+                    lambda work: self.commit(work, {"project-context.toml": "new"}, remove=removed)
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("base script", files["scripts/tool.py"])
+                for name in removed:
+                    self.assertFalse([f for f in files if f == name or f.startswith(f"{name}/")])
+
+    def test_a_symlink_in_the_roadmap_or_specs_is_rejected_before_anything_is_taken(self):
+        # Decision: reject (not core.symlinks=false), so the preview never silently reads a link.
+        for link in ("specs/old/spec.md", "specs/link.md", "ROADMAP.md", "specs"):
+            with self.subTest(link=link):
+                result, files, output = self.take_step(
+                    lambda work: self.commit(
+                        work, {}, remove=(link,), symlinks={link: "/etc/hostname"}
+                    )
+                )
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("::error::", result.stdout + result.stderr)
+                self.assertIn("symbolic link", result.stdout + result.stderr)
+                self.assertEqual("base script", files["scripts/tool.py"])
+
+    def test_the_code_changed_flag_covers_every_path_outside_the_roadmap_and_specs(self):
+        cases = (
+            ({"ROADMAP.md": "x", "specs/old/spec.md": "y"}, (), "false"),
+            ({"specs/new/plan.md": "y"}, (), "false"),
+            ({"scripts/tool.py": "x"}, (), "true"),
+            ({".github/workflows/w.yml": "x"}, (), "true"),
+            ({"project-context.toml": "x"}, (), "true"),
+            ({".specify/memory/constitution.md": "x"}, (), "true"),
+            ({"README.md": "x"}, (), "true"),
+            # The data pattern is anchored: a file that only starts like ROADMAP.md is code.
+            ({"ROADMAP.md.bak": "x"}, (), "true"),
+            ({"specs-extra.md": "x"}, (), "true"),
+            # A rename out of a code path: the old path is listed too.
+            ({"specs/old/tool.py": "base script"}, ("scripts/tool.py",), "true"),
+            # A rename from the data into a code path.
+            ({"scripts/spec.md": "base spec"}, ("specs/old/spec.md",), "true"),
+        )
+        for changes, remove, expected in cases:
+            with self.subTest(changes=list(changes), remove=remove):
+                result, _, output = self.take_step(lambda work: self.commit(work, changes, remove=remove))
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertIn(f"code_changed={expected}", output)
+
+    def test_the_preview_cancels_a_stale_run_but_the_comment_job_does_not(self):
+        self.assertIn("cancel-in-progress: true", job_block(PREVIEW, "preview"))
+        self.assertIn("cancel-in-progress: false", job_block(PREVIEW, "comment"))
+        self.assertNotIn("cancel-in-progress: true", job_block(PREVIEW, "comment"))
+
+    def test_the_comment_job_is_for_same_repository_pull_requests_and_runs_no_pr_code(self):
+        job = job_block(PREVIEW, "comment")
+        wrapped = re.search(r"^    if: (.*)$", job, re.MULTILINE).group(1)
+        condition = wrapped.removeprefix("${{ ").removesuffix(" }}")
+        self.assertIn("pull-requests: write", job)
+        self.assertNotIn("contents:", job.split("steps:")[0])
+        self.assertNotIn("actions/checkout", job)
+        self.assertNotIn("secrets.", job)
+        self.assertIn("<!-- roadmap-sync-preview -->", job)
+        self.assertIn("github-actions[bot]", job)
+        self.assertIn("-X PATCH", job)
+        for head, runs in (("o/r", True), ("fork/r", False)):
+            with self.subTest(head=head):
+                context = {
+                    "github.event.pull_request.head.repo.full_name": head,
+                    "github.repository": "o/r",
+                    "needs.preview.outputs.body": "text",
+                }
+                self.assertEqual(bool(evaluate(condition.replace("!cancelled() && ", ""), context)), runs)
+        self.assertTrue(condition.startswith("!cancelled() && "))
+        self.assertNotIn("always()", workflow_text(PREVIEW).replace("`always()`", ""))
+        self.assertIn("HEAD_SHA: ${{ github.event.pull_request.head.sha }}", job)
+        self.assertIn("MERGE_SHA: ${{ github.sha }}", job)
+
+    def test_both_jobs_use_a_per_pull_request_group(self):
+        text = workflow_text(PREVIEW)
+        self.assertRegex(text, r"group: issue-sync-preview-pr-\$\{\{ github\.event\.pull_request\.number \}\}\n")
+        self.assertRegex(
+            text, r"group: issue-sync-preview-pr-\$\{\{ github\.event\.pull_request\.number \}\}-comment\n"
+        )
+
+    def test_the_preview_step_drops_fence_lookalikes_and_fences_the_summary(self):
+        script = step_script("Preview the roadmap sync", WORKFLOWS / PREVIEW)
+        root = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory, "bin")
+            bin_dir.mkdir()
+            stub = bin_dir / "python3"
+            stub.write_text(
+                "#!/bin/sh\n"
+                'case "$1" in\n'
+                f'  scripts/sync-roadmap-issues.py) printf "[dry-run] create x\\n   ~~~~\\n~~~~~~\\n" ;;\n'
+                f'  *) exec "{sys.executable}" "$@" ;;\n'
+                "esac\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            summary, output = Path(directory, "summary"), Path(directory, "output")
+            summary.write_text("")
+            output.write_text("")
+            env = {
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "RUNNER_TEMP": directory,
+                "GITHUB_STEP_SUMMARY": str(summary),
+                "GITHUB_OUTPUT": str(output),
+                "CODE_CHANGED": "true",
+                "AUTO_APPLY": "",
+                "GH_TOKEN": "t",
+            }
+            result = subprocess.run(["bash", "-e", "-c", script], env=env, cwd=root, capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            for name in (summary, output):
+                text = name.read_text(encoding="utf-8")
+                fences = [line for line in text.splitlines() if re.match(r" {0,3}~{3,}", line)]
+                self.assertEqual(2 if name == summary else 0, len(fences), text)
+            self.assertIn("changes files other than ROADMAP.md and specs/", output.read_text(encoding="utf-8"))
+
+    def test_both_fence_filters_use_the_commonmark_closing_fence_rule(self):
+        text = workflow_text(PREVIEW)
+        self.assertEqual(2, text.count("sed -E -e '/^ {0,3}~{3,}/d'"))
+
+    def test_the_summary_is_written_to_the_output_with_a_random_delimiter(self):
+        job = job_block(PREVIEW, "preview")
+        self.assertIn("openssl rand", job)
+        self.assertIn("$GITHUB_OUTPUT", job)
+        self.assertNotIn("roadmap-sync-preview", job)  # the comment job owns the marker
+
+    def run_comment_step(self, body, existing_id=""):
+        script = step_script("Create or update the preview comment", WORKFLOWS / PREVIEW)
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory, "bin")
+            bin_dir.mkdir()
+            stub = bin_dir / "gh"
+            stub.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys, os, re\n"
+                "args = sys.argv[1:]\n"
+                "log = open(os.environ['STUB_LOG'], 'a')\n"
+                "log.write(' '.join(args) + '\\n')\n"
+                "for arg in args:\n"
+                "    match = re.match(r'body=@(.*)', arg)\n"
+                "    if match:\n"
+                "        log.write('BODY<<' + open(match.group(1)).read() + '>>BODY\\n')\n"
+                "if '--jq' in args and '-X' not in args:\n"
+                "    print(os.environ.get('STUB_ID', ''))\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            log = Path(directory, "log")
+            env = {
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "STUB_LOG": str(log),
+                "STUB_ID": existing_id,
+                "GH_TOKEN": "t",
+                "GITHUB_REPOSITORY": "o/r",
+                "PR_NUMBER": "7",
+                "HEAD_SHA": "a" * 40,
+                "MERGE_SHA": "b" * 40,
+                "RUNNER_TEMP": directory,
+                "BODY": body,
+            }
+            result = subprocess.run(["bash", "-e", "-c", script], env=env, capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            return log.read_text(encoding="utf-8")
+
+    def comment_body(self, log):
+        return log.split("BODY<<", 1)[1].split(">>BODY", 1)[0]
+
+    def test_the_comment_job_adds_the_marker_and_the_head_sha_itself(self):
+        log = self.run_comment_step("[dry-run] create Feature: x\n")
+        body = self.comment_body(log)
+        self.assertTrue(body.startswith("<!-- roadmap-sync-preview -->\n"))
+        self.assertIn("merge commit", body.split("~~~~", 1)[0])
+        self.assertIn("b" * 40, body)  # the merge commit the data came from
+        self.assertIn("a" * 40, body)  # the pull request head, for reference
+        self.assertIn("-X POST", log)
+        self.assertIn("[dry-run] create Feature: x", body)
+
+    def test_the_comment_job_updates_the_existing_comment_in_place(self):
+        log = self.run_comment_step("[dry-run] create Feature: x\n", existing_id="1234")
+        self.assertIn("-X PATCH repos/o/r/issues/comments/1234", log)
+        self.assertNotIn("-X POST", log)
+
+    def test_the_comment_job_neutralises_mentions_markup_and_a_forged_marker(self):
+        hostile = (
+            "[dry-run] create @octocat and @org/team <img src=x> <!-- roadmap-sync-preview -->\n"
+            "~~~~\n"
+            "   ~~~~\n"
+            "~~~~~~\n"
+            "  ~~~~~~~~text\n"
+            "[dry-run] ![t](https://example.invalid/p.png)\n"
+        )
+        body = self.comment_body(self.run_comment_step(hostile))
+        self.assertEqual(1, body.count("<!-- roadmap-sync-preview -->"))
+        self.assertNotRegex(body, r"@(?!\u200b)\w")
+        self.assertNotIn("<img", body)
+        # Only the fence the comment job writes: no line a CommonMark parser could take as a fence
+        # (up to three spaces of indentation, three or more tildes).
+        fence_lines = [line for line in body.splitlines() if re.match(r" {0,3}~{3,}", line)]
+        self.assertEqual(2, len(fence_lines))
+
+    def test_the_comment_job_caps_the_length_at_a_line_end(self):
+        # About 66 KB: over the job's 50000 cap, but under Linux's 128 KB limit for one environment
+        # variable (the body reaches the step through `env`; the preview job caps it at 60000 first).
+        lines = "".join(f"[dry-run] create Feature: {n} {'x' * 80}\n" for n in range(600))
+        body = self.comment_body(self.run_comment_step(lines))
+        self.assertLess(len(body), 62000)
+        shown = [line for line in body.splitlines() if line.startswith("[dry-run]")]
+        self.assertTrue(all(line.endswith("x" * 80) for line in shown))
+        self.assertIn("truncated", body)
 
 
 if __name__ == "__main__":

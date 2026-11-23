@@ -43,15 +43,16 @@ class SpecPlanBodyTest(unittest.TestCase):
         self.assertLess(steps.index("`speckit-clarify`"), steps.index("`speckit-plan`"))
         self.assertIn("Do not run `speckit-tasks` on this branch", body)
 
-    def test_merge_line_does_not_claim_automatic_unblocking(self):
+    def test_merge_line_names_the_sync_on_merge_and_how_to_turn_it_off(self):
         body = roadmap_issues.spec_plan_body({"id": "008", "title": "Example"}, "specs/008-example")
         text = " ".join(body.split())
         self.assertIn(
-            "Merging closes this issue; Phase 1 is unblocked by the next manual roadmap sync "
-            "run with **Apply changes** selected.",
+            "Merging closes this issue; the roadmap sync that runs on the merge then unblocks "
+            "Phase 1 (if the repository turned that off with `ROADMAP_SYNC_AUTO_APPLY=false`, "
+            "run the sync manually with **Apply changes** selected).",
             text,
         )
-        self.assertNotIn("and unblocks Phase 1", text)
+        self.assertNotIn("next manual roadmap sync run", text)
 
 
 SECTION = "# Roadmap\n\n## Planned Specs\n\n"
@@ -80,6 +81,7 @@ class RoadmapIssueSyncTest(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.fake = FakeGitHub()
+        self.sleeps = []
         self.write_roadmap(
             roadmap_entry("900", "Planned Feature", depends="901")
             + roadmap_entry("901", "Dependency Feature")
@@ -164,7 +166,7 @@ class RoadmapIssueSyncTest(unittest.TestCase):
             Path(__file__).parent.parent / ".github/workflows/sync-roadmap-issues.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("'issue-sync-preview'", workflow)
-        self.assertIn("'issue-sync'", workflow)
+        self.assertIn("'issue-sync-roadmap'", workflow)
         self.assertIn("inputs.apply == true", workflow)
 
     def test_project_defaults_come_from_shared_context(self):
@@ -196,7 +198,7 @@ class RoadmapIssueSyncTest(unittest.TestCase):
             patch.object(sync_task_issues, "ROOT", self.root),
             patch.object(sync_task_issues, "origin_repo", return_value=(OWNER, REPO)),
             patch.object(sync_task_issues, "gh", self.fake),
-            patch.object(sync_roadmap_issues.time, "sleep"),
+            patch.object(sync_roadmap_issues.time, "sleep", self.sleeps.append),
             contextlib.redirect_stdout(output),
         ):
             result = sync_roadmap_issues.main(command)
@@ -259,14 +261,15 @@ class RoadmapIssueSyncTest(unittest.TestCase):
         self.assertEqual({self.find(roadmap_issues.roadmap_marker("901"))["number"]},
                          self.fake.blockers[epic["number"]])
 
-    def test_provisional_phase_1_body_describes_manual_apply_only(self):
+    def test_provisional_phase_1_body_describes_when_the_blocker_is_removed(self):
         self.run_sync("--apply")
         body = self.phase1()["body"]
         self.assertNotIn("automatic apply", body)
         self.assertNotIn("dry-run rollout", body)
         self.assertIn(
-            "The sync removes the blocker only in a manual run of the roadmap sync workflow "
-            "with **Apply changes** selected; push and daily runs only preview.",
+            "The roadmap sync removes the blocker after that merge, in the run on the push to the "
+            "default branch, or in a manual run with **Apply changes** selected when the "
+            "repository variable `ROADMAP_SYNC_AUTO_APPLY` is `false`; daily runs only preview.",
             " ".join(body.split()),
         )
 
@@ -274,7 +277,7 @@ class RoadmapIssueSyncTest(unittest.TestCase):
         self.run_sync("--id", "900", "--apply")
         phase1 = self.phase1()
         old_body = phase1["body"].replace(
-            "The sync removes the blocker only in a manual run",
+            "The roadmap sync removes the blocker after that merge",
             "The blocker is removed automatically after a run",
         )
         phase1["body"] = old_body
@@ -286,7 +289,7 @@ class RoadmapIssueSyncTest(unittest.TestCase):
 
         self.run_sync("--id", "900", "--apply")
         self.assertNotEqual(old_body, phase1["body"])
-        self.assertIn("The sync removes the blocker only in a manual run", phase1["body"])
+        self.assertIn("The roadmap sync removes the blocker after that merge", phase1["body"])
 
     def test_sync_renders_wrapped_fields_and_updates_existing_epic_body(self):
         self.write_roadmap(WRAPPED_ENTRY)
@@ -533,11 +536,152 @@ class RoadmapIssueSyncTest(unittest.TestCase):
         self.assertEqual([], self.fake.mutations())
 
     def test_apply_stops_if_created_issues_are_not_visible(self):
-        with patch.object(sync_task_issues, "load_issues", return_value=[]):
-            with self.assertRaisesRegex(SystemExit, "did not become visible in time"):
+        with (
+            patch.object(sync_task_issues, "load_issues", return_value=[]),
+            patch.object(sync_task_issues, "fetch_issue", return_value=None),
+        ):
+            with self.assertRaisesRegex(SystemExit, "did not become visible in time.*rerun"):
                 self.run_sync("--id", "900", "--apply")
 
         self.assertEqual(3, len(self.fake.created()))  # epic, spec-plan and Phase 1
+        # Waits about a minute in total, so a lagging listing does not fail the run.
+        waited = sum(delay for delay in self.sleeps if delay >= 1)
+        self.assertGreaterEqual(waited, 55)
+        self.assertLessEqual(waited, 90)
+
+    def test_apply_links_issues_when_the_listing_lags_for_a_while(self):
+        real_load = sync_task_issues.load_issues
+        calls = []
+
+        def lagging_load(api):
+            calls.append(api)
+            # The initial read, then the first reloads still miss the created issues.
+            return [] if 2 <= len(calls) <= 8 else real_load(api)
+
+        with (
+            patch.object(sync_task_issues, "load_issues", lagging_load),
+            patch.object(sync_task_issues, "fetch_issue", return_value=None),
+        ):
+            result, _ = self.run_sync("--id", "900", "--apply")
+
+        self.assertEqual(0, result)
+        self.assertEqual(3, len(self.fake.created()))
+        self.assertEqual(2, len(self.fake.parents))  # planning issue and Phase 1 under the epic
+
+    def test_apply_completes_when_the_listing_never_shows_the_created_issues(self):
+        # The issues returned by the create calls are fetched by number (strongly consistent) and
+        # merged into the reloaded list, so a listing that lags forever does not matter.
+        with patch.object(sync_task_issues, "load_issues", return_value=[]):
+            result, _ = self.run_sync("--id", "900", "--apply")
+
+        self.assertEqual(0, result)
+        self.assertEqual(3, len(self.fake.created()))
+        self.assertEqual(2, len(self.fake.parents))
+        self.assertEqual([], [s for s in self.sleeps if s >= 1])
+
+    def test_report_sync_state_prints_whether_a_roadmap_epic_exists(self):
+        _, output = self.run_sync("--report-sync-state")
+        self.assertIn("Roadmap Epic exists: no", output)
+        self.fake.add_issue(1, f"{roadmap_issues.roadmap_marker('901')}\nbody")
+        _, output = self.run_sync("--report-sync-state")
+        self.assertIn("Roadmap Epic exists: yes", output)
+        self.assertEqual([], self.fake.mutations())
+
+    def run_task_sync(self, feature):
+        output = io.StringIO()
+        with (
+            patch.object(sync_task_issues, "ROOT", self.root.resolve()),
+            patch.object(sync_task_issues, "origin_repo", return_value=(OWNER, REPO)),
+            patch.object(sync_task_issues, "gh", self.fake),
+            patch.object(sync_task_issues.time, "sleep"),
+            contextlib.redirect_stdout(output),
+        ):
+            try:
+                result = sync_task_issues.main(["--feature", feature, "--apply", "--skip-project"])
+            except SystemExit as error:
+                result = error.code
+        return result, output.getvalue()
+
+    def write_feature(self, name, tasks=True):
+        directory = self.root / "specs" / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "spec.md").write_text("# Spec\n", encoding="utf-8")
+        (directory / "plan.md").write_text("# Plan\n", encoding="utf-8")
+        if tasks:
+            (directory / "tasks.md").write_text(
+                "# Tasks: Planned Feature\n\n## Phase 1: Setup\n\n- [ ] T001 Do it\n", encoding="utf-8"
+            )
+
+    def test_the_task_sync_renders_the_same_epic_body_as_the_roadmap_sync(self):
+        # One merge starts both syncs; they must not keep rewriting the Epic body.
+        self.write_feature("900-planned-feature")
+        self.run_sync("--id", "900", "--apply")
+        epic = self.find(roadmap_issues.roadmap_marker("900"))
+        body = epic["body"]
+        self.assertIn("spec.md", body)
+
+        result, _ = self.run_task_sync("specs/900-planned-feature")
+
+        self.assertEqual(0, result)
+        self.assertEqual(body, epic["body"])
+
+    def test_the_two_syncs_agree_when_several_spec_directories_exist_for_one_entry(self):
+        self.write_feature("900-planned-feature")
+        self.write_feature("900-renamed-feature")
+        self.run_sync("--id", "900", "--apply")
+        epic = self.find(roadmap_issues.roadmap_marker("900"))
+        body = epic["body"]
+
+        for feature in ("specs/900-planned-feature", "specs/900-renamed-feature"):
+            with self.subTest(feature=feature):
+                result, _ = self.run_task_sync(feature)
+                self.assertEqual(0, result)
+                self.assertEqual(body, epic["body"])
+
+    def test_an_uninitialised_repository_reports_that_no_epic_exists(self):
+        with patch.object(sync_task_issues.project_context, "bootstrap_state", return_value="uninitialized"):
+            result, output = self.run_sync("--report-sync-state")
+
+        self.assertEqual(0, result)
+        self.assertIn("Roadmap Epic exists: no", output)
+        self.assertEqual([], self.fake.mutations())
+
+    def test_the_state_line_is_not_printed_unless_asked(self):
+        _, output = self.run_sync()
+        self.assertNotIn("Roadmap Epic exists", output)
+
+    def test_apply_if_synced_stays_a_preview_before_the_first_sync(self):
+        result, output = self.run_sync("--apply-if-synced")
+
+        self.assertEqual(0, result)
+        self.assertIn("first roadmap sync is a manual, reviewed step", output)
+        self.assertIn("dry run", output)
+        self.assertIn("[dry-run] create Feature: 900 Planned Feature", output)
+        self.assertEqual([], self.fake.mutations())
+
+    def test_apply_if_synced_applies_once_a_roadmap_epic_exists(self):
+        self.fake.add_issue(1, f"{roadmap_issues.roadmap_marker('901')}\nbody")
+
+        result, output = self.run_sync("--apply-if-synced")
+
+        self.assertEqual(0, result)
+        self.assertIn("(apply;", output)
+        self.assertNotIn("first roadmap sync", output)
+        self.assertTrue(self.fake.created())
+
+    def test_apply_if_synced_ignores_a_marker_from_an_outsider(self):
+        self.fake.add_issue(
+            1,
+            f"{roadmap_issues.roadmap_marker('901')}\nbody",
+            author="stranger",
+            author_association="NONE",
+            label=None,
+        )
+
+        _, output = self.run_sync("--apply-if-synced")
+
+        self.assertIn("first roadmap sync is a manual, reviewed step", output)
+        self.assertEqual([], self.fake.mutations())
 
     def test_dry_run_does_not_make_mutating_github_calls(self):
         result, output = self.run_sync("--id", "900")

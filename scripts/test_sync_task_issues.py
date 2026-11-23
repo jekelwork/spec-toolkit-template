@@ -541,6 +541,70 @@ class PhaseSyncTest(unittest.TestCase):
                 result = error.code
         return result, output.getvalue()
 
+    def test_wait_for_phase_issues_backs_off_for_about_a_minute(self):
+        sleeps = []
+        feature = {"phases": [{"key": "phase-1"}]}
+        with (
+            patch.object(sync_task_issues, "load_issues", return_value=[]),
+            patch.object(sync_task_issues, "find_phase_issues", return_value={}),
+            patch.object(sync_task_issues.time, "sleep", sleeps.append),
+        ):
+            with self.assertRaisesRegex(SystemExit, "did not become visible in time.*rerun"):
+                sync_task_issues.wait_for_phase_issues("api", "specs/900-x", feature)
+
+        self.assertGreaterEqual(sum(sleeps), 55)
+        self.assertLessEqual(sum(sleeps), 90)
+
+    def test_wait_for_phase_issues_returns_once_the_listing_catches_up(self):
+        found = {"phase-1": {"number": 7}}
+        answers = [{}, {}, {}, {}, {}, {}, {}, found]
+        with (
+            patch.object(sync_task_issues, "load_issues", return_value=[]),
+            patch.object(sync_task_issues, "find_phase_issues", side_effect=answers),
+            patch.object(sync_task_issues.time, "sleep"),
+        ):
+            result = sync_task_issues.wait_for_phase_issues(
+                "api", "specs/900-x", {"phases": [{"key": "phase-1"}]}
+            )
+
+        self.assertEqual(found, result)
+
+    def test_wait_for_phase_issues_uses_the_created_issues_without_the_listing(self):
+        path = "specs/900-x"
+        created = [
+            {"number": 7, "body": f"{sync_task_issues.phase_marker(path, 'phase-1')}\nbody"}
+        ]
+        with (
+            patch.object(sync_task_issues, "load_issues", return_value=[]),
+            patch.object(sync_task_issues.time, "sleep") as sleep,
+        ):
+            result = sync_task_issues.wait_for_phase_issues(
+                "api", path, {"phases": [{"key": "phase-1"}]}, created=created
+            )
+
+        self.assertEqual(7, result["phase-1"]["number"])
+        sleep.assert_not_called()
+
+    def test_the_created_issue_is_fetched_by_number_in_the_listing_shape(self):
+        fake = FakeGitHub()
+        fake.add_issue(5, "body", label="Story")
+        fake.fail_on = lambda args: args[1].endswith("/issues/99")
+        with patch.object(sync_task_issues, "gh", fake):
+            issue = sync_task_issues.fetch_issue(f"repos/{OWNER}/{REPO}", 5)
+            missing = sync_task_issues.fetch_issue(f"repos/{OWNER}/{REPO}", 99)
+
+        self.assertEqual(5, issue["number"])
+        self.assertEqual(["Story"], issue["labels"])
+        self.assertEqual("tester", issue["author"])
+        self.assertIsNone(missing)
+        self.assertEqual(5, sync_task_issues.issue_number("https://github.com/o/r/issues/5\n"))
+
+    def test_merge_created_adds_only_issues_the_listing_lacks(self):
+        listed = [{"number": 1, "title": "listed"}]
+        created = [{"number": 1, "title": "stale"}, {"number": 2, "title": "new"}]
+        merged = sync_task_issues.merge_created(listed, created)
+        self.assertEqual([("listed"), "new"], [issue["title"] for issue in merged])
+
     def phases(self, fake):
         return {n: i for n, i in fake.issues.items() if i["label"] == "Story"}
 

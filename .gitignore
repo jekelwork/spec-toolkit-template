@@ -19,3 +19,6 @@ __pycache__/
 .github/agents/
 .claude/agents/
 .codex/agents/
+
+# Bootstrap review notes written for the pull request body (never committed)
+/bootstrap-review-notes.md

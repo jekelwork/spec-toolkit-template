@@ -46,6 +46,11 @@ ENV = dict(os.environ, GH_PAGER="cat", GH_PROMPT_DISABLED="1")
 # Changes a dry run or --check would have made; --check fails when this is not empty.
 PENDING = []
 RATE_LIMIT_RETRIES = 5
+# GitHub's issue listing can lag behind creation by a minute when several issues are created in
+# one run: wait with a capped backoff (2, 4, 8, 12, ... seconds; about a minute in total).
+VISIBILITY_ATTEMPTS = 8
+VISIBILITY_DELAY = 2
+VISIBILITY_MAX_DELAY = 12
 RATE_LIMIT_ERROR = re.compile(r"HTTP\s+429|rate limit", re.IGNORECASE)
 
 
@@ -190,18 +195,45 @@ def phase_marker(feature_path, phase_key):
     return roadmap_issues.phase_marker(feature_path, phase_key)
 
 
+ISSUE_FIELDS = (
+    "{number, id, node_id, title, body, parent, state, state_reason, "
+    "author: .user.login, author_association, "
+    "assignees: [.assignees[]?.login], labels: [.labels[]?.name]}"
+)
+
+
 def load_issues(api):
     output = gh(
         "api",
         "--paginate",
         f"{api}/issues?state=all&per_page=100",
         "--jq",
-        ".[] | select(.pull_request == null) | "
-        "{number, id, node_id, title, body, parent, state, state_reason, "
-        "author: .user.login, author_association, "
-        "assignees: [.assignees[]?.login], labels: [.labels[]?.name]}",
+        f".[] | select(.pull_request == null) | {ISSUE_FIELDS}",
     ).stdout
     return [json.loads(line) for line in output.splitlines()]
+
+
+def issue_number(url):
+    """The number at the end of an issue URL, as printed by `gh issue create`."""
+    return int(url.strip().rstrip("/").rsplit("/", 1)[1])
+
+
+def fetch_issue(api, number):
+    """One issue by number in the shape `load_issues` returns, or None when it cannot be read.
+
+    Unlike the listing, a read by number is not subject to the search index lag, so it sees an issue
+    right after it was created.
+    """
+    result = gh("api", f"{api}/issues/{number}", "--jq", ISSUE_FIELDS, check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return json.loads(result.stdout)
+
+
+def merge_created(issues, created):
+    """The listing plus the created issues it does not show (yet); the listing wins otherwise."""
+    listed = {issue["number"] for issue in issues}
+    return [*issues, *(issue for issue in created if issue and issue["number"] not in listed)]
 
 
 def find_phase_issues(issues, feature_path=None, roadmap_id=None):
@@ -350,15 +382,30 @@ def stop_for_removed_phases(feature_path, blocked):
     )
 
 
-def wait_for_phase_issues(api, feature_path, feature, attempts=6, delay=2):
+def visibility_delay(attempt, delay=VISIBILITY_DELAY, cap=VISIBILITY_MAX_DELAY):
+    """Seconds to wait after a listing attempt (0-based) that did not show the created issues."""
+    return min(delay * 2**attempt, cap)
+
+
+def wait_for_phase_issues(
+    api, feature_path, feature, attempts=VISIBILITY_ATTEMPTS, delay=VISIBILITY_DELAY, created=()
+):
+    """Phase issues of the feature once all are visible.
+
+    `created` are the issues this run just created, fetched by number; they stand in for whatever
+    the lagging listing does not show yet. The backoff is the fallback when one could not be fetched.
+    """
     for attempt in range(attempts):
-        phase_issues = find_phase_issues(load_issues(api), feature_path)
+        phase_issues = find_phase_issues(merge_created(load_issues(api), created), feature_path)
         missing = [phase["key"] for phase in feature["phases"] if phase["key"] not in phase_issues]
         if not missing:
             return phase_issues
         if attempt < attempts - 1:
-            time.sleep(delay)
-    sys.exit(f"Created issues did not become visible in time: {', '.join(missing)}")
+            time.sleep(visibility_delay(attempt, delay))
+    sys.exit(
+        f"Created issues did not become visible in time: {', '.join(missing)}. "
+        "They exist; rerun the sync to finish."
+    )
 
 
 def create_issue(repository, title, body, labels):
@@ -885,17 +932,17 @@ def main(argv=None):
     print(f"Using roadmap epic #{roadmap_epic['number']} for roadmap entry {roadmap_id}")
 
     missing = [phase for phase in feature["phases"] if not phase_issues.get(phase["key"])]
+    created = []
     for phase in missing:
         title = phase_title(phase)
         if args.apply:
-            print(
-                f"{phase['key']} created "
-                f"{create_issue(repository, title, phase_body(feature_path, feature, phase), 'Story')}"
-            )
+            url = create_issue(repository, title, phase_body(feature_path, feature, phase), "Story")
+            print(f"{phase['key']} created {url}")
+            created.append(fetch_issue(api, issue_number(url)))
         else:
             dry_run(f"create phase: {title}")
     if args.apply and missing:
-        phase_issues = wait_for_phase_issues(api, feature_path, feature)
+        phase_issues = wait_for_phase_issues(api, feature_path, feature, created=created)
 
     state_changes = {}
     phases_reopened = reopen_incomplete_phases(
@@ -903,13 +950,15 @@ def main(argv=None):
     )
 
     planning_numbers = {key: issue["number"] for key, issue in planning_issues.items() if issue}
+    # The same feature path the roadmap sync renders, so the two never rewrite each other's body.
+    epic_path = roadmap_issues.feature_path_for(ROOT, roadmap_entry)
     epic_content = (
         roadmap_epic["title"],
         roadmap_issues.roadmap_epic_body(
             roadmap_entry,
             planning_numbers,
-            roadmap_issues.feature_path(roadmap_entry, feature_path),
-            roadmap_issues.existing_artifacts(ROOT, feature_path),
+            epic_path,
+            roadmap_issues.existing_artifacts(ROOT, epic_path),
         ),
     )
     issues_updated = update_existing_issues(

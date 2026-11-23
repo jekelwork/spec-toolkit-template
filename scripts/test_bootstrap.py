@@ -1244,6 +1244,17 @@ class StartSubcommandTest(BootstrapTestCase):
         self.assertIn("--confirm first_sync@", self.out)
         self.assertRegex(self.out, r"first_sync@[0-9a-f]{12} --full-dry-run\n")
 
+    def test_the_review_notes_option_is_listed_in_the_help_usage_and_parsed_by_the_engine(self):
+        help_text = " ".join(bootstrap.build_parser().format_help().split())
+        self.assertIn("[--review-notes]", help_text)
+
+        parsed = bootstrap_start.parse_arguments(["--confirm", "pull_request@0123456789ab",
+                                                  "--review-notes"])
+        self.assertIs(True, parsed.review_notes)
+        self.assertIs(False, bootstrap_start.parse_arguments([]).review_notes)
+        with self.assertRaises(ValueError):  # the flag takes no value
+            bootstrap_start.parse_arguments(["--review-notes", "other.md"])
+
     def test_the_arguments_after_start_reach_the_engine_unchanged(self):
         argv = ["--no-input", "--confirm", "bootstrap_issue@0123456789ab", "--issue", "7",
                 "--name", "n", "--description", "d", "--owner", "o", "--project-number", "3",
